@@ -1,12 +1,129 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Hydra</title>
-  </head>
-  <body>
-    <!-- placeholder; the ui agent owns and replaces this file -->
-    <p style="font-family: -apple-system; color: #9a9aa6; padding: 24px">Hydra UI placeholder</p>
-  </body>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Hydra</title>
+  <link rel="stylesheet" href="ui.css" />
+</head>
+<body data-state="idle">
+
+  <header class="titlebar" data-tauri-drag-region>
+    <span class="wordmark">HYDRA</span>
+  </header>
+
+  <main class="content">
+
+    <section class="url-area" aria-label="New download">
+      <input id="url-input" class="url-input" type="text" placeholder="Paste a download URL..."
+             inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false"
+             aria-label="Download URL" />
+      <p id="url-msg" class="url-msg" role="status" aria-live="polite">
+        <svg class="spinner" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false">
+          <circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="2.2"
+                  stroke-linecap="round" stroke-dasharray="22 12.3" />
+        </svg>
+        <span id="url-msg-text"></span>
+      </p>
+    </section>
+
+    <section id="ready-card" class="card ready-card" hidden aria-label="Download details">
+      <div class="field-grid">
+        <label class="field-label" for="filename-input">Save as</label>
+        <input id="filename-input" class="filename-input" type="text" spellcheck="false"
+               autocomplete="off" aria-label="Save as file name" />
+      </div>
+      <div class="meta-row">
+        <span id="size-text" class="size-text num"></span>
+        <span id="ranges-badge" class="badge"></span>
+        <span id="type-chip" class="chip"></span>
+        <span id="resume-badge" class="badge badge-green" hidden></span>
+      </div>
+      <div class="field-grid">
+        <span class="field-label" id="save-label">Save to</span>
+        <span class="save-controls" id="save-controls">
+          <svg class="icon icon-folder" viewBox="0 0 14 14" width="13" height="13" aria-hidden="true" focusable="false">
+            <path d="M1.9 4.1c0-.61.5-1.1 1.11-1.1h2.63l1.3 1.5h3.96c.61 0 1.11.49 1.11 1.1v5.1c0 .61-.5 1.1-1.11 1.1H3.01c-.61 0-1.11-.49-1.11-1.1v-5.6z"
+                  fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+          </svg>
+          <span id="dest-text" class="dest-text is-empty">No folder chosen</span>
+          <button id="choose-btn" class="btn btn-secondary btn-sm" type="button">Choose...</button>
+        </span>
+      </div>
+      <div class="field-grid">
+        <span class="field-label" id="conn-field-label">Connections</span>
+        <span class="conn-controls">
+          <span class="stepper" role="group" aria-labelledby="conn-field-label">
+            <button id="conn-minus" class="btn btn-step" type="button" aria-label="Decrease connections">&#8722;</button>
+            <span id="conn-value" class="step-value num" aria-live="polite">8</span>
+            <button id="conn-plus" class="btn btn-step" type="button" aria-label="Increase connections">+</button>
+          </span>
+          <span id="conn-note" class="conn-note" hidden></span>
+        </span>
+      </div>
+      <div class="action-row">
+        <span id="folder-prompt" class="folder-prompt" hidden>Choose a folder to continue</span>
+        <button id="download-btn" class="btn btn-primary" type="button">Download</button>
+      </div>
+    </section>
+
+    <section id="progress-card" class="card progress-card" hidden aria-label="Download progress">
+      <div class="progress-head">
+        <span id="dl-name" class="dl-name"></span>
+        <span id="speed-readout" class="speed-readout num"></span>
+      </div>
+      <div id="bar-track" class="bar-track"><div id="bar-fill" class="bar-fill"></div></div>
+      <p class="status-line num">
+        <span id="st-bytes" class="st-part"></span><span id="st-speed" class="st-part st-speed"></span><span id="st-eta" class="st-part st-eta"></span>
+      </p>
+      <p id="state-note" class="state-note" hidden></p>
+      <div id="conn-grid" class="conn-grid"></div>
+      <div id="error-banner" class="error-banner" hidden role="alert">
+        <svg class="icon icon-dot" viewBox="0 0 12 12" width="11" height="11" aria-hidden="true" focusable="false">
+          <circle cx="6" cy="6" r="4.2" fill="currentColor" />
+        </svg>
+        <span id="error-msg"></span>
+      </div>
+      <div id="done-block" class="done-block" hidden>
+        <svg class="icon icon-check" viewBox="0 0 22 22" width="24" height="24" aria-hidden="true" focusable="false">
+          <circle cx="11" cy="11" r="9.4" fill="none" stroke="currentColor" stroke-width="1.5" />
+          <path d="M6.8 11.4l2.7 2.7 5.7-5.9" fill="none" stroke="currentColor" stroke-width="1.9"
+                stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <div class="done-info">
+          <div id="done-size" class="done-size num"></div>
+          <div class="done-path-row">
+            <svg class="icon icon-folder" viewBox="0 0 14 14" width="12" height="12" aria-hidden="true" focusable="false">
+              <path d="M1.9 4.1c0-.61.5-1.1 1.11-1.1h2.63l1.3 1.5h3.96c.61 0 1.11.49 1.11 1.1v5.1c0 .61-.5 1.1-1.11 1.1H3.01c-.61 0-1.11-.49-1.11-1.1v-5.6z"
+                    fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+            </svg>
+            <span id="done-path" class="done-path"></span>
+          </div>
+        </div>
+      </div>
+      <div class="action-row">
+        <button id="pause-btn" class="btn btn-secondary" type="button">Pause</button>
+        <button id="resume-btn" class="btn btn-secondary" type="button" hidden>Resume</button>
+        <button id="cancel-btn" class="btn btn-danger" type="button">Cancel</button>
+        <button id="retry-btn" class="btn btn-primary" type="button" hidden>Try again</button>
+        <button id="reveal-btn" class="btn btn-primary" type="button" hidden>
+          <svg class="icon icon-reveal" viewBox="0 0 14 14" width="13" height="13" aria-hidden="true" focusable="false">
+            <path d="M7 9.2V2.4M4.5 4.9L7 2.4l2.5 2.5" fill="none" stroke="currentColor" stroke-width="1.5"
+                  stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M2.5 8.8v2.1c0 .6.45 1.1 1 1.1h7c.55 0 1-.5 1-1.1v-2.1" fill="none" stroke="currentColor"
+                  stroke-width="1.5" stroke-linecap="round" />
+          </svg>
+          Reveal in Finder
+        </button>
+      </div>
+    </section>
+
+    <p id="footer-hint" class="footer-hint">Downloads resume automatically if interrupted.</p>
+
+  </main>
+
+  <script src="mock-tauri.js"></script>
+  <script src="main.js"></script>
+</body>
 </html>

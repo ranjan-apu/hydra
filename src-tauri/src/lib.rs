@@ -1,18 +1,29 @@
-//! Hydra backend - minimal compiling scaffold.
-//! The engine agent replaces this file with the real implementation,
-//! keeping the plugin registration and adding all CONTRACT.md commands.
+//! Hydra backend: a tauri-free download engine (src/engine) plus the thin
+//! Tauri bridge (src/bridge.rs). lib.rs wires plugins, managed state, and every
+//! CONTRACT command into the invoke handler.
 
-#[tauri::command]
-fn hydra_ping() -> &'static str {
-    "pong"
-}
+mod bridge;
+pub mod engine;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![hydra_ping])
+        .manage(bridge::Registry::new())
+        .invoke_handler(tauri::generate_handler![
+            bridge::hydra_ping,
+            bridge::probe_url,
+            bridge::start_download,
+            bridge::pause_download,
+            bridge::resume_download,
+            bridge::cancel_download,
+            bridge::pick_folder,
+            bridge::reveal_path,
+            bridge::get_settings,
+            bridge::save_settings,
+            bridge::meta_check
+        ])
         .run(tauri::generate_context!())
         .expect("error while running hydra");
 }

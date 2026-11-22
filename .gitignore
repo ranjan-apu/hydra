@@ -5,3 +5,5 @@ src-tauri/gen/schemas/
 *.hydra.json
 .DS_Store
 tmp/
+
+.impeccable/
