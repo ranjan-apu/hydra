@@ -1,0 +1,7 @@
+node_modules/
+src-tauri/target/
+src-tauri/gen/schemas/
+*.part
+*.hydra.json
+.DS_Store
+tmp/
