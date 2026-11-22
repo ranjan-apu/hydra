@@ -56,9 +56,15 @@ Dev run: npx tauri dev
 
 ## Test
 
-The whole gate (throughput on the reference CDN + resume + fallback + flaky + units):
+The whole gate (throughput on a reference target + resume + fallback + flaky + units):
 
     bash scripts/acceptance.sh
+
+The two CDN stages need a reference URL - none is committed to this repo:
+
+    export HYDRA_REF_URL="https://your-cdn.example/big-file.bin"
+
+Without it, stages 1-2 SKIP and the localhost + unit stages run on their own.
 
 Local-only modes of the test server (no CDN traffic):
 
@@ -81,8 +87,9 @@ Tauri contract:
     open "http://127.0.0.1:8801/ui/index.html?demo=downloading"
 
 Demo states: ready | downloading | paused | done | error | unknown | single |
-resume | noranges | folderprompt | probing. Inside real Tauri the mock stands
-aside automatically (window.__TAURI_INTERNALS__ check).
+resume | noranges | folderprompt | probing - plus URL trigger words (see
+ui/mock-tauri.js for the full set). Inside real Tauri the mock stands aside
+automatically (window.__TAURI_INTERNALS__ check).
 
 ## Layout
 
@@ -96,3 +103,12 @@ aside automatically (window.__TAURI_INTERNALS__ check).
 ## Non-goals
 
 Torrents/magnet links, browser extension, scheduling/queues, accounts, telemetry.
+
+## Roadmap
+
+Known gaps and the improvement plan (engine hardening, accessibility ports,
+verification additions) live in [ROADMAP.md](ROADMAP.md).
+
+## License
+
+MIT - see [LICENSE](LICENSE).

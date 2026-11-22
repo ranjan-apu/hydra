@@ -32,7 +32,7 @@ TESTSERVER="$ROOT/scripts/testserver.py"
 SPEEDTEST="$ROOT/src-tauri/target/release/examples/speedtest"
 
 # Reference target from CONTRACT.md ("Reference test target" section).
-DEFAULT_REF_URL="https://reference-cdn.example/dld/reference-path?token=REDACTED"
+DEFAULT_REF_URL="${HYDRA_REF_URL:-}"  # no reference target committed; export HYDRA_REF_URL to enable the CDN stages
 
 ACC_DIR="/tmp/hydra-acc"
 RUN_LOG="$ACC_DIR/last-run.log"
@@ -52,7 +52,8 @@ STAGE_FAIL=0
 
 usage() {
   echo "usage: scripts/acceptance.sh [REF_URL]"
-  echo "  REF_URL defaults to the CONTRACT.md reference target."
+  echo "  REF_URL defaults to \$HYDRA_REF_URL. No reference target is committed;"
+  echo "  without one, the two CDN stages SKIP and the local stages run."
 }
 
 ARG1=""
@@ -68,6 +69,7 @@ fi
 REF_URL="$DEFAULT_REF_URL"
 if [ -n "$ARG1" ]; then REF_URL="$ARG1"; fi
 case "$REF_URL" in
+  "") ;;  # unset: the two CDN stages will SKIP
   http://*|https://*) ;;
   *) echo "error: REF_URL must start with http:// or https:// (got: $REF_URL)" >&2
      exit 2 ;;
@@ -264,6 +266,10 @@ stage_build() {
 
 stage_throughput() {
   local ok avg err rc ok1 avg1 err1
+  if [ -z "$REF_URL" ]; then
+    note "no reference target: export HYDRA_REF_URL to enable this stage"
+    return 2
+  fi
   if ! run_speed 300 "$REF_URL" 4 1073741824 "$ACC_DIR/speed4.part" 0; then
     note "4-conn run failed or timed out (see log above)"
     return 1
@@ -302,6 +308,11 @@ stage_resume() {
   local out="$ACC_DIR/full.part"
   local meta="$ACC_DIR/full.hydra.json"   # out with .part -> .hydra.json
   local ok bytes data REF_SHA pb sha ok2 res err
+
+  if [ -z "$REF_URL" ]; then
+    note "no reference target: export HYDRA_REF_URL to enable this stage"
+    return 2
+  fi
 
   # (a) fresh full run: first 512 MiB of REF_URL with 4 connections
   if ! run_speed 240 "$REF_URL" 4 536870912 "$out" 0; then
@@ -554,6 +565,9 @@ run_stage() {  # run_stage <label> <function>
   if [ "$rc" -eq 0 ]; then
     STAGE_RESULTS+=("PASS")
     echo "==> PASS: $label  | $CURRENT_DETAIL"
+  elif [ "$rc" -eq 2 ]; then
+    STAGE_RESULTS+=("SKIP")
+    echo "==> SKIP: $label  | $CURRENT_DETAIL"
   else
     STAGE_RESULTS+=("FAIL")
     STAGE_FAIL=1
@@ -586,7 +600,11 @@ print_summary() {
 
 echo "Hydra acceptance harness"
 echo "  repo      : $ROOT"
-echo "  ref url   : $REF_URL"
+if [ -n "$REF_URL" ]; then
+  echo "  ref url   : $REF_URL"
+else
+  echo "  ref url   : (unset - CDN stages 1-2 will SKIP; export HYDRA_REF_URL)"
+fi
 echo "  speedtest : $SPEEDTEST"
 echo "  temp dir  : $ACC_DIR (removed on exit)"
 

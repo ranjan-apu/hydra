@@ -10,7 +10,7 @@ example at. Neither script touches anything outside `scripts/` and
 ## Running
 
 ```bash
-scripts/acceptance.sh              # full acceptance, CONTRACT.md reference URL
+scripts/acceptance.sh              # full acceptance (CDN stages need HYDRA_REF_URL; SKIP without it)
 scripts/acceptance.sh <REF_URL>    # same stages against a different target
 ```
 

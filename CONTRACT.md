@@ -156,13 +156,15 @@ ETA "4m 12s" / "1h 03m".
   resumed=<0|1> single=<0|1>" or "SUMMARY ok=0 error=<message>"; exit code 0 iff ok=1.
   avg_mibps is an honest wall-clock average of the transfer (probing excluded).
 
-## Reference test target (acceptance only - lead runs it; agents must not download from it)
+## Reference test target (NOT committed to this repo)
 
-https://reference-cdn.example/dld/reference-path?token=REDACTED
+No specific download target is committed here. The acceptance harness takes its
+reference URL from the environment:
 
-7,772,412,965 bytes, HTTP/1.1 only, server: Nexus/1.0, accept-ranges: bytes, ranged GET -> 206
-with content-range "bytes 0-1048575/7772412965", content-disposition:
-attachment; filename="reference-file.mkv";
-filename*=UTF-8''reference-file.mkv
-Single flow swings 2.8-29.4 MiB/s; 4 parallel flows sustain ~25.9 MiB/s.
-Acceptance: pulling this file with 4 connections must average >= 25 MiB/s.
+    export HYDRA_REF_URL="https://your-cdn.example/file.bin?token=..."
+
+A good reference target: HTTP/1.1, Accept-Ranges: bytes, ranged GET returning
+206 with a Content-Range total, a Content-Length of at least ~1 GiB, on a
+network where a single flow is bandwidth-unstable (the motivating pathology).
+Acceptance: pulling it with 4 connections must average >= 25 MiB/s.
+Without HYDRA_REF_URL the two CDN stages SKIP and the local + unit stages run.
