@@ -16,17 +16,24 @@
   pick folder, download; live speed, ETA, and per-connection fill bars are the hero elements.
 - **Positioning**: parallel multi-stream downloader with per-connection visibility and
   automatic sidecar resume, in a native macOS shell.
-- **Capabilities**: probe (HEAD -> ranged-GET fallback), editable filename, remembered folder
-  + 1-16 connections, parallel ranged download with per-chunk retry, pause/resume/cancel,
-  .part + .hydra.json sidecar resume across restarts, single-stream fallback when ranges are
-  refused or size unknown, final size verify, Reveal in Finder.
-- **Brand commitments**: "HYDRA" letterspaced wordmark; pinned palette/type/radius; English
-  copy; no emoji - hand-drawn inline SVGs only.
+- **Capabilities**: probe (HEAD -> ranged-GET fallback, plus an active range verification
+  when the origin omits Accept-Ranges), editable filename, remembered folder + 1-16
+  connections, parallel ranged download with per-chunk retry and per-chunk byte caps,
+  pause/resume/cancel, .part + .hydra.json sidecar resume across restarts, single-stream
+  fallback when ranges are refused or size unknown, per-chunk byte accounting at completion,
+  Reveal in Finder.
+- **What the probe surfaces** (this is product value, not chrome): size, whether ranges are
+  supported, which method decided it (HEAD / Range GET), the answering server, and whether a
+  resumable partial already exists - all before the user commits to a download.
+- **Brand commitments**: "Hydra" wordmark over a three-stream brand mark that answers live
+  transfer; a single spring-mint accent (#4fe0b0) on night-blue graphite; monospace for all
+  data (URLs, names, paths, byte counts); English copy; no emoji - hand-drawn inline SVGs only.
 
 ## Principles
 
 1. The multi-connection advantage must be visible (the conn grid is the hero).
 2. Never leave the user uninformed - backend-driven speed/ETA at >= 4 Hz.
-3. Native restraint - one accent, tonal depth, no shadows.
+3. Native restraint - one accent doing real work, tonal depth, shadows only as soft
+   offset plates under raised surfaces.
 4. The backend is the source of truth for speed/ETA; the UI only formats.
 5. Errors are human lowercase strings, shown verbatim.

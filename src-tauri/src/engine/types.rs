@@ -8,6 +8,11 @@
 use serde::Serialize;
 
 /// Result of the `probe_url` command - CONTRACT "Commands / probe_url".
+///
+/// `server` is the one additive field beyond CONTRACT.md: the raw `Server`
+/// response header of the response that decided the probe result (absent when
+/// the origin sent none), so the UI can show what answered. Every other field
+/// and JSON name is byte-identical to the contract.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeInfo {
@@ -21,6 +26,9 @@ pub struct ProbeInfo {
     pub content_type: Option<String>,
     /// "head" | "range".
     pub probe_method: String,
+    /// Raw `Server` response header, omitted from the wire when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
 }
 
 /// One connection's status inside a `hydra://progress` payload.
@@ -113,6 +121,8 @@ mod tests {
 
     #[test]
     fn probe_info_wire_shape() {
+        // server present: serialized LAST (additive field; every pre-existing
+        // key keeps its name and position).
         let p = ProbeInfo {
             url: "https://final.example/dld/file.mkv".into(),
             size: Some(7772412965),
@@ -120,12 +130,14 @@ mod tests {
             filename: "reference-file.mkv".into(),
             content_type: Some("application/octet-stream".into()),
             probe_method: "head".into(),
+            server: Some("nginx/1.25.3".into()),
         };
         let j = serde_json::to_string(&p).unwrap();
         assert_eq!(
             j,
-            r#"{"url":"https://final.example/dld/file.mkv","size":7772412965,"acceptsRanges":true,"filename":"reference-file.mkv","contentType":"application/octet-stream","probeMethod":"head"}"#
+            r#"{"url":"https://final.example/dld/file.mkv","size":7772412965,"acceptsRanges":true,"filename":"reference-file.mkv","contentType":"application/octet-stream","probeMethod":"head","server":"nginx/1.25.3"}"#
         );
+        // server absent: the field is omitted entirely (not null).
         let u = ProbeInfo {
             url: "u".into(),
             size: None,
@@ -133,6 +145,7 @@ mod tests {
             filename: "d".into(),
             content_type: None,
             probe_method: "range".into(),
+            server: None,
         };
         assert_eq!(
             serde_json::to_string(&u).unwrap(),

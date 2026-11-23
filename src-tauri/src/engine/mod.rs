@@ -7,6 +7,7 @@
 //! headlessly.
 
 pub mod download;
+pub mod errors;
 pub mod meta;
 pub mod names;
 pub mod plan;
@@ -14,7 +15,7 @@ pub mod probe;
 pub mod settings;
 pub mod types;
 
-pub use download::{Ctrl, DownloadSpec, run};
+pub use download::{run, Ctrl, DownloadSpec};
 pub use probe::probe;
 
 use std::time::Duration;

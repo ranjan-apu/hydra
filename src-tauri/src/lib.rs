@@ -12,7 +12,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(bridge::Registry::new())
         .invoke_handler(tauri::generate_handler![
-            bridge::hydra_ping,
             bridge::probe_url,
             bridge::start_download,
             bridge::pause_download,

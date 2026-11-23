@@ -12,6 +12,13 @@ impl ChunkSpec {
     pub fn len(&self) -> u64 {
         self.end - self.start + 1
     }
+
+    /// A chunk always covers at least one byte by construction, but the pair is
+    /// spelled out so the type does not look like a collection with a missing
+    /// half.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// ceil(size / connections); 0 for a zero-size file or zero connections.
@@ -20,7 +27,7 @@ pub fn chunk_size(size: u64, connections: usize) -> u64 {
         return 0;
     }
     let n = connections as u64;
-    (size + n - 1) / n
+    size.div_ceil(n)
 }
 
 /// CONTRACT fresh plan: chunk i has start = i*chunkSize and
@@ -137,8 +144,20 @@ mod tests {
     fn big_non_divisible_plan_is_contiguous_and_covers() {
         let c = build_chunks(7772412965, 4);
         assert_eq!(c.len(), 4);
-        assert_eq!(c[0], ChunkSpec { start: 0, end: 1943103241 });
-        assert_eq!(c[3], ChunkSpec { start: 5829309726, end: 7772412964 });
+        assert_eq!(
+            c[0],
+            ChunkSpec {
+                start: 0,
+                end: 1943103241
+            }
+        );
+        assert_eq!(
+            c[3],
+            ChunkSpec {
+                start: 5829309726,
+                end: 7772412964
+            }
+        );
         let mut next = 0u64;
         for ch in &c {
             assert_eq!(ch.start, next);

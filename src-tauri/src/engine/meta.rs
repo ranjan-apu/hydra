@@ -46,7 +46,11 @@ pub fn save_atomic(path: &Path, meta: &MetaFile) -> std::io::Result<()> {
 }
 
 /// Same-directory temp path for the atomic save.
-fn tmp_path(path: &Path) -> PathBuf {
+///
+/// Public because cancel cleanup must be able to remove a temp file that an
+/// in-flight save left behind; keeping the naming here means there is exactly
+/// one definition of it.
+pub fn tmp_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(".tmp");
     PathBuf::from(s)
@@ -108,7 +112,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("hydra-unit-meta-{}-{}", tag, std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("hydra-unit-meta-{}-{}", tag, std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -120,7 +125,11 @@ mod tests {
             url: "https://nexus/dld/file?token=1".into(),
             size: 7772412965,
             chunk_size: 1943103242,
-            chunks: vec![MetaChunk { start: 0, end: 1943103241, done: 1943103242 }],
+            chunks: vec![MetaChunk {
+                start: 0,
+                end: 1943103241,
+                done: 1943103242,
+            }],
         };
         let json = serde_json::to_string(&m).unwrap();
         assert_eq!(
@@ -142,8 +151,16 @@ mod tests {
             size: 10,
             chunk_size: 5,
             chunks: vec![
-                MetaChunk { start: 0, end: 4, done: 1 },
-                MetaChunk { start: 5, end: 9, done: 0 },
+                MetaChunk {
+                    start: 0,
+                    end: 4,
+                    done: 1,
+                },
+                MetaChunk {
+                    start: 5,
+                    end: 9,
+                    done: 0,
+                },
             ],
         };
         save_atomic(&path, &m).unwrap();
@@ -175,8 +192,16 @@ mod tests {
             size: 10,
             chunk_size: 5,
             chunks: vec![
-                MetaChunk { start: 0, end: 4, done: 0 },
-                MetaChunk { start: 5, end: 9, done: 0 },
+                MetaChunk {
+                    start: 0,
+                    end: 4,
+                    done: 0,
+                },
+                MetaChunk {
+                    start: 5,
+                    end: 9,
+                    done: 0,
+                },
             ],
         };
         assert!(is_compatible(&base(), "u", 10));
@@ -203,7 +228,12 @@ mod tests {
         inverted.chunks[1].end = 3;
         assert!(!is_compatible(&inverted, "u", 10));
 
-        let empty = MetaFile { url: "u".into(), size: 0, chunk_size: 0, chunks: vec![] };
+        let empty = MetaFile {
+            url: "u".into(),
+            size: 0,
+            chunk_size: 0,
+            chunks: vec![],
+        };
         assert!(is_compatible(&empty, "u", 0));
         let _ = empty;
     }
@@ -215,22 +245,38 @@ mod tests {
             size: 100,
             chunk_size: 50,
             chunks: vec![
-                MetaChunk { start: 0, end: 49, done: 60 },
-                MetaChunk { start: 50, end: 99, done: 30 },
+                MetaChunk {
+                    start: 0,
+                    end: 49,
+                    done: 60,
+                },
+                MetaChunk {
+                    start: 50,
+                    end: 99,
+                    done: 30,
+                },
             ],
         };
         // part file only 70 bytes long: chunk 0 fits, chunk 1's claim does not.
         clamp_dones(&mut m, 70);
         assert_eq!(m.chunks[0].done, 50); // clamped to len
         assert_eq!(m.chunks[1].done, 0); // part_len < 50+30
-        // Boundary: exactly long enough keeps the claim.
+                                         // Boundary: exactly long enough keeps the claim.
         let mut m2 = MetaFile {
             url: "u".into(),
             size: 100,
             chunk_size: 50,
             chunks: vec![
-                MetaChunk { start: 0, end: 49, done: 50 },
-                MetaChunk { start: 50, end: 99, done: 30 },
+                MetaChunk {
+                    start: 0,
+                    end: 49,
+                    done: 50,
+                },
+                MetaChunk {
+                    start: 50,
+                    end: 99,
+                    done: 30,
+                },
             ],
         };
         clamp_dones(&mut m2, 80);
@@ -240,7 +286,11 @@ mod tests {
             url: "u".into(),
             size: 10,
             chunk_size: 10,
-            chunks: vec![MetaChunk { start: 0, end: 9, done: 0 }],
+            chunks: vec![MetaChunk {
+                start: 0,
+                end: 9,
+                done: 0,
+            }],
         };
         clamp_dones(&mut m3, 0);
         assert_eq!(m3.chunks[0].done, 0);
@@ -253,8 +303,16 @@ mod tests {
             size: 100,
             chunk_size: 50,
             chunks: vec![
-                MetaChunk { start: 0, end: 49, done: 10 },
-                MetaChunk { start: 50, end: 99, done: 7 },
+                MetaChunk {
+                    start: 0,
+                    end: 49,
+                    done: 10,
+                },
+                MetaChunk {
+                    start: 50,
+                    end: 99,
+                    done: 7,
+                },
             ],
         };
         assert_eq!(bytes_done(&m), 17);
