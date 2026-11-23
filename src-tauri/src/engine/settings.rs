@@ -81,7 +81,11 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("hydra-unit-settings-{}-{}", tag, std::process::id()));
+        let d = std::env::temp_dir().join(format!(
+            "hydra-unit-settings-{}-{}",
+            tag,
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -127,7 +131,10 @@ mod tests {
 
     #[test]
     fn wire_shape_is_camel_case() {
-        let s = Settings { dest_dir: Some("/x".into()), connections: 3 };
+        let s = Settings {
+            dest_dir: Some("/x".into()),
+            connections: 3,
+        };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(json, "{\"destDir\":\"/x\",\"connections\":3}");
         let null = serde_json::to_string(&Settings::default()).unwrap();
