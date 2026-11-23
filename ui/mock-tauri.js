@@ -286,6 +286,15 @@
     return true;
   }
 
+  // A headless capture fires while the 200ms width transitions are still
+  // running, which makes a screenshot a picture of an animation rather than of
+  // the state. Snap mode removes motion so the frame is the settled truth.
+  if (SNAP) {
+    var kill = document.createElement("style");
+    kill.textContent = "*,*::before,*::after{transition:none!important;animation:none!important}";
+    document.head.appendChild(kill);
+  }
+
   window.addEventListener("load", function () {
     if (!demo) return;
     // Hold one request open while the demo runs, so a headless capture waits for

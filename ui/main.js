@@ -252,6 +252,7 @@
     delete S.deadIds[id];
     rebuildList();
     if (S.view === id) setView("compose", false);
+    renderChrome();
   }
 
   // ---------- sidebar ----------
@@ -433,6 +434,10 @@
     // Navigation is never gated: at the cap the user still needs to get back to
     // the compose form (and to a row, to free a slot). Only Start is disabled.
     els.newBtn.title = "";
+    // The compose action bar depends on the active count (the cap disables Start
+    // and explains why), so it has to follow the count even while the stage shows
+    // a run - otherwise finishing a download leaves a stale "8 at once" lock.
+    if (S.view === "compose") renderFooter();
   }
 
   // ---------- compose ----------
@@ -608,9 +613,13 @@
       S.starting = false;
       S.pending = null;
       S.adoptedId = null;
-      if (adoptedOnError) {
+      if (adoptedOnError && S.items[adoptedOnError]) {
         // The run is real even though the reply was lost.
         setView(adoptedOnError);
+        resetCompose();
+      } else if (adoptedOnError) {
+        // Cancelled while the reply was in flight: nothing to show or report.
+        setView("compose");
         resetCompose();
       } else {
         S.composeError = errText(err);
@@ -862,6 +871,11 @@
     }
     if (!item) return;
 
+    // done/error are final for an id: a frame that was already in flight must not
+    // resurrect a settled row (which is what happens when a cancel loses its race
+    // and the retried id stops being suppressed).
+    if (!terminal && (item.state === "done" || item.state === "error")) return;
+
     if (p.state === "downloading") item.note = p.note || "";
     if (p.state === "paused") item.note = "Paused, offsets saved";
     if (p.state === "done") {
@@ -973,6 +987,13 @@
     } catch (err) {
       // A pause can fail for real (the flush failed), so the row has to say so
       // instead of keeping a stale "downloading" that still counts toward the cap.
+      // A run that finished while the command was in flight is not a failure.
+      if (item.state === "done") {
+        delete S.controlBusy[item.id];
+        els.pauseBtn.disabled = false;
+        renderChrome();
+        return;
+      }
       item.state = "error";
       item.error = errText(err);
       item.speedBps = 0;
@@ -1027,6 +1048,8 @@
         item.state = "error";
         item.error = errText(err);
         renderDetail(true);
+      } else if (S.items[adoptedOnError]) {
+        setView(adoptedOnError);
       }
     }
     renderChrome();
