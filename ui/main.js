@@ -207,6 +207,7 @@
     if (at >= 0) S.order.splice(at, 1);
     delete S.rowEls[id];
     delete S.dirty[id];
+    delete S.deadIds[id];
     rebuildList();
     if (S.view === id) setView("compose", false);
   }
@@ -296,13 +297,21 @@
       row.fill.style.width = p.toFixed(1) + "%";
     }
     if (item.state === "error") row.pct.textContent = p == null ? "" : Math.floor(p) + "%";
-    row.x.textContent = "\u00d7";
-    row.x.setAttribute(
-      "aria-label",
-      item.state === "downloading" || item.state === "paused"
-        ? "Cancel " + item.filename + " and delete its partial data"
-        : "Remove " + item.filename + " from the list"
-    );
+    if (row.x.textContent !== "\u00d7") row.x.textContent = "\u00d7";
+    if (row.label !== item.state) {
+      row.label = item.state;
+      row.x.setAttribute(
+        "aria-label",
+        item.state === "downloading" || item.state === "paused"
+          ? "Cancel " + item.filename + " and delete its partial data"
+          : "Remove " + item.filename + " from the list"
+      );
+    }
+    var btnLabel = item.filename + ", " + (STATE_LABEL[item.state] || item.state);
+    if (row.btnLabel !== btnLabel) {
+      row.btnLabel = btnLabel;
+      row.btn.setAttribute("aria-label", btnLabel);
+    }
   }
 
   function updateRow(id) {
@@ -547,6 +556,7 @@
         destDir: args.destDir,
         connections: args.connections,
         size: args.size,
+        acceptsRanges: args.acceptsRanges,
         state: "downloading",
         bytesDone: 0,
         total: args.size,
@@ -659,7 +669,7 @@
   function applyConns(item) {
     var conns = item.conns || [];
     S.liveConns = conns.length || item.connections;
-    els.connGrid.hidden = S.liveConns <= 1;
+    els.connGrid.hidden = S.liveConns <= 1 || item.state === "done";
     var key = item.id + ":" + conns.length;
     if (conns.length > 0 && (S.gridKey !== key || (S.cells.length !== conns.length))) {
       buildConnGrid(conns.length);
@@ -796,6 +806,7 @@
         destDir: S.settings.destDir || "",
         connections: S.settings.connections,
         size: null,
+        acceptsRanges: !!(S.probe && S.probe.acceptsRanges),
         state: "downloading",
         bytesDone: 0,
         total: null,
@@ -945,7 +956,9 @@
       filename: item.filename,
       connections: item.connections,
       size: item.size,
-      acceptsRanges: true
+      // Reuse what the probe actually found: claiming range support an origin
+      // refused would put a retry into a mode that origin cannot serve.
+      acceptsRanges: item.acceptsRanges !== false
     };
     S.starting = true;
     try {
