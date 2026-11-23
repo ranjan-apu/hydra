@@ -203,3 +203,52 @@ repo's header without breaking the one-accent rule:
 
 Torrents/magnet links, browser extension, scheduling/queues, accounts,
 telemetry.
+
+---
+
+## Status after the second audit round
+
+A second, independent read-only audit of this repo (25 correctness/contract findings + 8
+resource findings) was cross-checked line by line against the code. All of it was real; two
+items were judgement calls and are answered below. Everything was then fixed on
+`fix/audit-round-2`.
+
+| Finding | State |
+|---|---|
+| #1 cancel returned before cleanup | **fixed** - `Ctrl::Cancel` carries a oneshot ack; the bridge replies only once the files are gone |
+| #2 ranged worker dropped its buffered tail on EOF/stall/error | **fixed** - the buffer is flushed before every retry (this was a regression from the previous round) |
+| #3 resumed run + HTTP 200 truncated the .part | **fixed** - the fallback arm now requires `!plan.resumed` |
+| #4 start ack could resurrect a settled run | **fixed** - the ack is ignored once the run is no longer starting; terminal events end the handshake |
+| #5 resume stage hashed a stale file (vacuous proof) | **fixed** - the wipe step deletes the completed file too, so the resumed bytes are what gets hashed |
+| #6 sidecar fsynced before the .part | **fixed** - the .part is fsynced inside the same blocking save, before the sidecar claims it |
+| #7 pause claimed "offsets saved" after a failed flush | **fixed** - `flush_meta` returns `io::Result` and the pause path reports an error instead |
+| #8 stall stage passed without a read deadline | **fixed** - the assertion is now two-sided (28-42 s) |
+| #9 ranged stages never asserted `single=0` | **fixed** |
+| #10 a late probe result could override an edited URL | **fixed** - probe generation counter plus a URL match check |
+| #11 / #25 / R6 fixed scratch dir | **fixed** - `mktemp -d`, removed on exit, never reused |
+| #12 `exists()` then `rename` TOCTOU | **fixed** - the target is reserved with `create_new`; a contention test pins it |
+| #13 terminal event after cancel | **fixed** - retired ids are remembered and their events dropped |
+| #14 `abort()` cannot stop in-flight `spawn_blocking` | **fixed** - saves check a dedicated cancelling flag before renaming, plus the existing sweep |
+| #15 no coverage for range verification or `size=null` | **fixed** - new `noadvertise` / `nolength` server modes and stages 9-10 |
+| #16 paused note outlived its state | **fixed** |
+| #17 reveal error class leaked into the next completion | **fixed** |
+| #18 / R5 `.hydra-write-probe` could truncate a user file | **fixed** - unique name reserved with `create_new` |
+| #19 server header could come from HEAD while the GET decided | **fixed** - only the deciding response is reported |
+| #20 raw error text reached the UI | **fixed** |
+| #21 concurrent settings saves could drop a field | **fixed** - serialized behind a lock |
+| #22 stale docs | **fixed** - README, CONTRACT and scripts/README-TESTS.md describe the shipped behaviour |
+| #23 docstring named a flag that did not exist | **fixed** - `--stall-prefix` is now a real flag |
+| #24 oversend could not over-send the final chunk | **fixed** - the filler wraps around past EOF |
+| R1 unbounded event queue | **fixed** - bounded channel; progress dropped when full, state waits briefly so done/error are never lost |
+| R2 no cap on concurrent downloads | **fixed** - 8-run cap plus a per-`.part` ownership check |
+| R8 a new HTTP client per probe/run | **fixed** - one process-wide client (90 s idle pool) |
+
+### Deliberate non-changes
+
+- **R3** - a failed run still keeps its `.part` and sidecar. That is the input to "Try again" and
+  to a later resume, and it can be gigabytes the user already paid for. Cancel is the explicit
+  delete action, and it now acks only after the files are gone. Documented in CONTRACT.md.
+- **R4** - the sidecar temp name stays deterministic because cancel cleanup has to name it to
+  delete it; unique temps would make a crashed save's leftover unsweepable. Concurrent saves of
+  one path are impossible (single writer, joined before the pause flush) and a leftover is
+  overwritten by the next save. Documented in `meta::tmp_path`.

@@ -11,7 +11,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{channel, unbounded_channel, Receiver, UnboundedSender};
 
 use crate::engine::settings::Settings;
 use crate::engine::types::{EngineEvent, ProbeInfo, ProgressPayload, StatePayload};
@@ -23,11 +23,26 @@ use crate::engine::{self, names, Ctrl, DownloadSpec};
 pub struct Registry {
     inner: Mutex<HashMap<String, Handle>>,
     next: AtomicU64,
+    /// Serialises settings writes: load-modify-save over a shared temp file must
+    /// not interleave, or one partial update silently drops the other field.
+    settings_lock: tokio::sync::Mutex<()>,
+    /// Serialises the whole start sequence. The concurrency cap, the per-path
+    /// ownership check and the insert are separate acquisitions of `inner`, so
+    /// two start IPCs could otherwise both pass the checks and both insert. One
+    /// guard around all of it makes the reservation atomic.
+    start_lock: tokio::sync::Mutex<()>,
 }
+
+/// Cap on simultaneously running downloads. Each run holds a coordinator fd plus
+/// one fd per worker, so an unbounded number of them is an fd/RAM exhaustion
+/// path. The UI never gets near this; it exists because IPC is a trust boundary.
+const MAX_CONCURRENT_DOWNLOADS: usize = 8;
 
 #[derive(Clone)]
 struct Handle {
     ctrl: UnboundedSender<Ctrl>,
+    /// The .part this run owns, so a second run cannot target the same file.
+    part_path: PathBuf,
 }
 
 impl Registry {
@@ -35,6 +50,8 @@ impl Registry {
         Registry {
             inner: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
+            settings_lock: tokio::sync::Mutex::new(()),
+            start_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -52,6 +69,19 @@ impl Registry {
 
     fn get(&self, id: &str) -> Option<Handle> {
         self.inner.lock().unwrap().get(id).cloned()
+    }
+
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    /// True when a live run already owns this destination file.
+    fn owns_path(&self, part_path: &std::path::Path) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .any(|h| h.part_path == part_path)
     }
 }
 
@@ -115,10 +145,23 @@ pub async fn start_download(
     check_writable(&dir)?;
 
     let registry = app.state::<Registry>();
+    // Held until the handle is inserted: makes "is there room, is this path free"
+    // plus the insert one atomic decision.
+    let _start_guard = registry.start_lock.lock().await;
+    // IPC is a trust boundary: nothing stops a caller from asking for twenty
+    // simultaneous downloads, and each one costs a coordinator fd plus a worker
+    // fd per connection. Cap the count and refuse a second run on the same file.
+    let part_path = dir.join(format!("{}.part", filename));
+    if registry.len() >= MAX_CONCURRENT_DOWNLOADS {
+        return Err("too many downloads in progress".to_string());
+    }
+    if registry.owns_path(&part_path) {
+        return Err("that file is already downloading".to_string());
+    }
     let id = registry.alloc_id();
     let spec = DownloadSpec {
         url,
-        part_path: dir.join(format!("{}.part", filename)),
+        part_path: part_path.clone(),
         meta_path: dir.join(format!("{}.hydra.json", filename)),
         final_path: dir.join(&filename),
         connections,
@@ -129,10 +172,21 @@ pub async fn start_download(
         accepts_ranges,
     };
 
-    let (evt_tx, evt_rx) = unbounded_channel::<EngineEvent>();
+    // Bounded: a stalled webview must not let the event queue grow without
+    // limit. Progress frames are dropped when it fills; state frames wait.
+    let (evt_tx, evt_rx) = channel::<EngineEvent>(engine::download::EVENT_QUEUE_CAP);
     let (ctrl_tx, ctrl_rx) = unbounded_channel::<Ctrl>();
     tokio::spawn(engine::run(spec, evt_tx, ctrl_rx));
-    registry.insert(id.clone(), Handle { ctrl: ctrl_tx });
+    registry.insert(
+        id.clone(),
+        Handle {
+            ctrl: ctrl_tx,
+            part_path,
+        },
+    );
+    // The reservation is complete: release the start lock (and with it the borrow
+    // of app) before the forwarder takes ownership of the handle.
+    drop(_start_guard);
     spawn_forwarder(app, id.clone(), evt_rx);
     Ok(StartAck { id })
 }
@@ -171,8 +225,28 @@ pub async fn resume_download(app: AppHandle, id: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn cancel_download(app: AppHandle, id: String) -> Result<(), String> {
     let registry = app.state::<Registry>();
-    if let Some(handle) = registry.get(&id) {
-        let _ = handle.ctrl.send(Ctrl::Cancel);
+    let Some(handle) = registry.get(&id) else {
+        return Ok(());
+    };
+    // Ask first, forget only once the engine confirms the files are gone: the UI
+    // immediately re-checks for a resumable partial, and an immediate restart on
+    // the same filename must not be able to race the cleanup sweep.
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+    let sent = handle.ctrl.send(Ctrl::Cancel(Some(ack_tx))).is_ok();
+    if sent {
+        // Bounded wait: a wedged engine must not wedge the IPC call. No ack means
+        // the engine was already past the point of no return (it had renamed the
+        // file), so say that rather than claiming a clean cancel.
+        // Only Ok(Ok(())) is an ack. Ok(Err(_)) means the engine dropped the
+        // sender without confirming, which is exactly as unconfirmed as a timeout.
+        let acked = matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await,
+            Ok(Ok(()))
+        );
+        if !acked {
+            registry.remove(&id);
+            return Err("the download had already finished".to_string());
+        }
     }
     registry.remove(&id);
     Ok(())
@@ -205,7 +279,7 @@ pub async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
 pub async fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
     app.opener()
         .reveal_item_in_dir(&path)
-        .map_err(|e| format!("could not reveal item: {}", e))
+        .map_err(|_| "could not reveal that file".to_string())
 }
 
 /// CONTRACT get_settings.
@@ -224,6 +298,8 @@ pub async fn save_settings(
     dest_dir: Option<Option<String>>,
     connections: Option<u64>,
 ) -> Result<(), String> {
+    let registry = app.state::<Registry>();
+    let _guard = registry.settings_lock.lock().await;
     let path = settings_path(&app);
     let mut current = engine::settings::load(&path);
     // clamp in u64 first: casting a huge value to u32 would wrap before the
@@ -233,7 +309,7 @@ pub async fn save_settings(
         dest_dir,
         connections.map(|c| c.clamp(1, 16) as u32),
     );
-    engine::settings::save(&path, &current).map_err(|e| format!("could not save settings: {}", e))
+    engine::settings::save(&path, &current).map_err(|_| "could not save settings".to_string())
 }
 
 /// CONTRACT meta_check: whether a resumable sidecar matching url+size exists.
@@ -290,7 +366,7 @@ pub async fn meta_check(
 
 /// Forward EngineEvents to the frontend, injecting the download id; forgets
 /// the handle after a terminal state.
-fn spawn_forwarder(app: AppHandle, id: String, mut rx: UnboundedReceiver<EngineEvent>) {
+fn spawn_forwarder(app: AppHandle, id: String, mut rx: Receiver<EngineEvent>) {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             match ev {
@@ -319,6 +395,10 @@ fn spawn_forwarder(app: AppHandle, id: String, mut rx: UnboundedReceiver<EngineE
                 }
             }
         }
+        // The engine is gone (it dropped its sender). Release the slot even when
+        // no terminal state arrived, or one dropped event would permanently eat a
+        // concurrency slot.
+        app.state::<Registry>().remove(&id);
     });
 }
 
@@ -340,14 +420,38 @@ fn check_writable(dir: &std::path::Path) -> Result<(), String> {
         }
         Ok(_) => {}
     }
-    let probe = dir.join(".hydra-write-probe");
-    match std::fs::File::create(&probe) {
-        Err(e) => Err(engine::errors::write_error(Some(dir), &e)),
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            Ok(())
+    // A unique name reserved with create_new: a user file that happens to be
+    // called .hydra-write-probe is never truncated, and two concurrent checks
+    // cannot collide.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Retry rather than report a collision as a write failure: the name is
+    // unlikely but not impossible to take, and the answer to that is another name.
+    for _ in 0..8 {
+        let seq = PROBE_SEQ.fetch_add(1, Ordering::SeqCst);
+        let probe = dir.join(format!(
+            ".hydra-write-probe-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            seq
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(engine::errors::write_error(Some(dir), &e)),
         }
     }
+    Err("destination is not writable".to_string())
 }
 
 #[cfg(test)]

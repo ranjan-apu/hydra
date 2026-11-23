@@ -28,11 +28,22 @@ use std::time::Duration;
 /// The crate's reqwest is configured with default-features = false and
 /// features = ["rustls-tls", "stream"], which already excludes the http2 and
 /// compression features; http1_only() pins it explicitly.
+/// One client for the whole process.
+///
+/// A probe and a download used to build their own client, so every run threw
+/// away a warm connection pool and every TLS handshake had to happen again.
+/// reqwest::Client is an Arc internally, so handing out clones is free.
 pub fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent("Hydra/0.1")
-        .http1_only()
-        .connect_timeout(Duration::from_secs(30))
-        .build()
-        .expect("failed to build reqwest client")
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent("Hydra/0.1")
+                .http1_only()
+                .connect_timeout(Duration::from_secs(30))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .build()
+                .expect("failed to build reqwest client")
+        })
+        .clone()
 }

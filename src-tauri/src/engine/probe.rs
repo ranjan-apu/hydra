@@ -69,7 +69,10 @@ pub async fn probe(url: &str, client: &Client) -> Result<ProbeInfo, String> {
                 filename,
                 content_type,
                 probe_method: "range".into(),
-                server: verified_server.or(server),
+                // CONTRACT: the Server header of the response that DECIDED the
+                // result. The ranged GET decided this one, so its header is the
+                // answer even when it is absent - never the HEAD one.
+                server: verified_server,
             }),
             // The verification is an optimisation, never a requirement.
             Err(_) => Ok(ProbeInfo {

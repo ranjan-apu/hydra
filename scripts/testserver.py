@@ -16,11 +16,18 @@ headless speedtest harness can exercise the downloader's HTTP behaviours:
                  excess, so the client really does receive it). Pins the
                  downloader's per-chunk byte cap: a client without one writes
                  past the chunk end and corrupts its neighbour.
-  --mode stall   range mode, PLUS the first request for any given range gets
-                 its headers plus --stall-prefix bytes and then silence (no
-                 FIN, no RST) for --stall-secs. The same range is served in
-                 full on a later request, so a client with a read timeout
-                 converges; one without hangs forever. Pins the stall timeout.
+  --mode stall   range mode, PLUS up to --stall-requests responses get their
+                 headers plus --stall-prefix bytes and then silence (no FIN, no
+                 RST) for --stall-secs. Once the budget is spent every response
+                 is served in full, so a client with a read timeout converges
+                 and one without hangs forever. Pins the stall timeout.
+  --mode noadvertise  HEAD answers 200 with a truthful Content-Length but NO
+                 Accept-Ranges header, while ranged GETs really do return 206.
+                 Pins the active range verification: a client that trusts the
+                 missing header would settle for one connection.
+  --mode nolength  no Content-Length anywhere and a close-delimited body, so the
+                 probe cannot learn the size. Pins the unknown-size path
+                 (single sequential stream, no sidecar, no resume).
   --mode flaky   range mode, PLUS drops the connection mid-body with
                  probability --drop-p after sending a random 0-256 KiB
                  prefix. The server remembers the last dropped byte-range
@@ -28,8 +35,9 @@ headless speedtest harness can exercise the downloader's HTTP behaviours:
                  retries always converge. Ranges of length 1 (probe
                  "bytes=0-0") are never dropped.
 
-Every response carries Content-Type: application/octet-stream, a true
-Content-Length, and Connection: close. The server is quiet (no per-request
+Every response carries Content-Type: application/octet-stream and
+Connection: close, and a true Content-Length - except in nolength mode, where
+the body is deliberately close-delimited so no length can be learned. The server is quiet (no per-request
 logging), robust against client aborts, and handles 16+ concurrent
 connections. The file is served at "/" regardless of its on-disk name.
 
@@ -62,9 +70,14 @@ DROP_P = 0.15
 STALL_SECS = 45
 RNG = random.Random()
 
-# Stall-mode memory: ranges that have already stalled once, so a retry of the
-# same range is served in full and the run can converge.
+# Stall-mode memory.
+#
+# STALLED remembers ranges that already stalled, and STALL_BUDGET caps how many
+# stalls the whole run may produce. The budget is what makes the fixture converge:
+# a client that flushes what it received before retrying (correctly) asks for a
+# SHIFTED range next time, which the per-range memory alone would stall forever.
 STALLED = set()
+STALL_BUDGET = 4
 
 # Flaky-mode per-server memory: the most recently dropped (start, end).
 LAST_DROPPED = None
@@ -106,7 +119,18 @@ class QuietHandler(BaseHTTPRequestHandler):
 
     # ---- request routing ------------------------------------------------
     def do_HEAD(self):
-        if MODE == "norange":
+        if MODE == "noadvertise":
+            # Truthful length, but this origin simply never advertises ranges.
+            self.send_response(200)
+            self._common_headers(SIZE)
+            self.end_headers()
+        elif MODE == "nolength":
+            # Close-delimited body: no length is learnable from HEAD either.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+        elif MODE == "norange":
             self.send_response(200)
             self._common_headers(SIZE)
             self.send_header("Accept-Ranges", "none")
@@ -180,6 +204,22 @@ class QuietHandler(BaseHTTPRequestHandler):
 
     # ---- body -------------------------------------------------------------
     def _serve_get(self):
+        if MODE == "nolength":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                sent = 0
+                while sent < SIZE:
+                    piece = DATA[sent:sent + CHUNK]
+                    if not piece:
+                        break
+                    self.wfile.write(piece)
+                    sent += len(piece)
+            except OSError:
+                pass
+            return
         if MODE == "norange":
             # Range is IGNORED: always the full body with 200.
             self._send_slice(200, 0, SIZE - 1, [("Accept-Ranges", "none")])
@@ -217,10 +257,14 @@ class QuietHandler(BaseHTTPRequestHandler):
             return  # defensive: never a body for HEAD
         if MODE == "stall":
             with STATE_LOCK:
-                first_time = (start, end) not in STALLED
-                if first_time:
+                # Only body responses longer than 1 byte consume the budget, so a
+                # "bytes=0-0" probe is never the thing that stalls.
+                global STALL_BUDGET
+                stall_now = length > 1 and STALL_BUDGET > 0 and (start, end) not in STALLED
+                if stall_now:
+                    STALL_BUDGET -= 1
                     STALLED.add((start, end))
-            if first_time:
+            if stall_now:
                 # Headers are on the wire and Content-Length promises more: go
                 # silent without closing, the worst case for a reader that has
                 # no idle timeout.
@@ -264,8 +308,15 @@ class QuietHandler(BaseHTTPRequestHandler):
                     need = take - len(piece)
                     piece = piece + DATA[end + 1:end + 1 + need]
                 else:
+                    # Past the declared range end: the excess the client must
+                    # ignore. On the FINAL chunk there is nothing past EOF, so the
+                    # filler wraps around from the start - otherwise this mode
+                    # could never exercise the last-chunk cap at all.
                     off = end + 1 + (sent - length)
                     piece = DATA[off:off + take]
+                    if not piece and SIZE:
+                        wrapped = (off - (end + 1)) % SIZE
+                        piece = DATA[wrapped:wrapped + take]
                 if not piece:
                     break
                 self.wfile.write(piece)
@@ -280,11 +331,12 @@ class QuietHandler(BaseHTTPRequestHandler):
 
 
 def main(argv=None):
-    global MODE, DATA, SIZE, DROP_P, STALL_SECS, RATE_BYTES
+    global MODE, DATA, SIZE, DROP_P, STALL_SECS, RATE_BYTES, STALL_PREFIX, STALL_BUDGET
     parser = argparse.ArgumentParser(
         description="Hydra acceptance-test file server (see scripts/README-TESTS.md)")
     parser.add_argument("--mode",
-                        choices=("range", "norange", "flaky", "oversend", "stall"),
+                        choices=("range", "norange", "flaky", "oversend", "stall",
+                                 "noadvertise", "nolength"),
                         default="range", help="server behaviour (default: range)")
     parser.add_argument("--port", type=int, default=8899,
                         help="listen port (default: 8899)")
@@ -298,6 +350,11 @@ def main(argv=None):
                         help="stall mode: seconds of silence before closing (default: 45)")
     parser.add_argument("--rate-kib", dest="rate_kib", type=float, default=0.0,
                         help="throttle each connection to this many KiB/s (default: unlimited)")
+    parser.add_argument("--stall-prefix", dest="stall_prefix", type=int,
+                        default=STALL_PREFIX,
+                        help="stall mode: bytes sent before going silent (default: 4096)")
+    parser.add_argument("--stall-requests", dest="stall_requests", type=int, default=STALL_BUDGET,
+                        help="stall mode: how many responses may stall in total (default: 4)")
     args = parser.parse_args(argv)
     if not 0.0 <= args.drop_p <= 1.0:
         parser.error("--drop-p must be within [0.0, 1.0]")
@@ -313,6 +370,8 @@ def main(argv=None):
             DATA = f.read()
     MODE, SIZE, DROP_P = args.mode, len(DATA), args.drop_p
     STALL_SECS = args.stall_secs
+    STALL_PREFIX = max(0, args.stall_prefix)
+    STALL_BUDGET = max(0, args.stall_requests)
     RATE_BYTES = int(args.rate_kib * 1024) if args.rate_kib > 0 else 0
     server = QuietServer((args.bind, args.port), QuietHandler)
     print("testserver mode=%s bind=%s port=%d file=%s size=%d drop_p=%s"

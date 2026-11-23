@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{unbounded_channel, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 use tokio::task::{spawn_blocking, JoinHandle};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -51,13 +52,32 @@ const BACKOFF_CAP: Duration = Duration::from_secs(8);
 /// deletes all progress). A body block that does not arrive within this window
 /// is treated exactly like any other retryable stream error.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Capacity of the engine -> embedder event queue.
+///
+/// Bounded on purpose: the previous unbounded channel could grow without limit
+/// if the consumer (the webview) stalled, at ~4 progress frames a second for the
+/// life of the download. Progress frames are dropped when it is full; state
+/// frames instead wait briefly for room, because done/error carry the only path
+/// and message the user will ever see.
+pub const EVENT_QUEUE_CAP: usize = 128;
+/// Upper bound on how long a state event may wait for queue space.
+///
+/// Generous on purpose: progress frames drop when the queue is full, so the queue
+/// can only be full of progress and it always drains. A short budget would drop
+/// the one event that carries the final path or the error message.
+const STATE_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Control messages the embedder sends into a running engine.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum Ctrl {
     Pause,
     Resume,
-    Cancel,
+    /// Stop and delete the .part and the sidecar.
+    ///
+    /// The optional ack fires only after those files are actually gone, so the
+    /// caller can report "cancelled" honestly and an immediately following run
+    /// with the same destination cannot race the cleanup sweep.
+    Cancel(Option<oneshot::Sender<()>>),
 }
 
 /// A download to run. Paths are explicit so the app bridge and the speedtest
@@ -254,8 +274,15 @@ fn join_io_error(e: tokio::task::JoinError) -> io::Error {
     io::Error::other(format!("blocking task failed: {}", e))
 }
 
-fn emit_state(events: &UnboundedSender<EngineEvent>, payload: StatePayload) {
-    let _ = events.send(EngineEvent::State(payload));
+/// Publish a state change (see EVENT_QUEUE_CAP for the delivery policy).
+async fn emit_state(events: &Sender<EngineEvent>, payload: StatePayload) {
+    let _ = timeout(STATE_SEND_TIMEOUT, events.send(EngineEvent::State(payload))).await;
+}
+
+/// Publish a progress sample. Dropping one is always preferable to queueing it
+/// behind a slow consumer: the next tick supersedes it 250 ms later.
+fn emit_progress(events: &Sender<EngineEvent>, payload: ProgressPayload) {
+    let _ = events.try_send(EngineEvent::Progress(payload));
 }
 
 fn state_payload(state: &str) -> StatePayload {
@@ -563,29 +590,55 @@ async fn run_ranged(ctx: &WorkerCtx) {
             tokio::select! {
                 biased;
                 _ = ctx.token.cancelled() => return,
-                item = timeout(READ_TIMEOUT, stream.next()) => match item {
-                    // Stall: no block arrived within READ_TIMEOUT. Retryable,
-                    // exactly like any other mid-body stream error.
-                    Err(_elapsed) => break,
-                    Ok(None) => {
-                        // Early EOF: the server closed before the chunk end.
-                        break;
-                    }
-                    Ok(Some(Err(_))) => {
-                        // Mid-body error: retry from the current offset.
-                        break;
-                    }
-                    Ok(Some(Ok(chunk))) => {
-                        // Never buffer more than the chunk still needs: any
-                        // excess is a non-conforming server and is ignored,
-                        // so nothing can spill into a neighbouring chunk.
-                        let room = cap_now.saturating_sub(buf.len());
-                        let take = chunk.len().min(room);
-                        if take > 0 {
-                            buf.extend_from_slice(&chunk[..take]);
+                item = timeout(READ_TIMEOUT, stream.next()) => {
+                    // Stall, early EOF and mid-body error all mean the same
+                    // thing here: this response is over. Whatever already
+                    // arrived is real data, so it is flushed before the retry -
+                    // otherwise an origin that closes every response early
+                    // would be asked for the same bytes five times and the
+                    // download would fail making no progress at all.
+                    let response_ended = match item {
+                        Err(_elapsed) => true,
+                        Ok(None) => true,
+                        Ok(Some(Err(_))) => true,
+                        Ok(Some(Ok(chunk))) => {
+                            // Never buffer more than the chunk still needs: any
+                            // excess is a non-conforming server and is ignored,
+                            // so nothing can spill into a neighbouring chunk.
+                            let room = cap_now.saturating_sub(buf.len());
+                            let take = chunk.len().min(room);
+                            if take > 0 {
+                                buf.extend_from_slice(&chunk[..take]);
+                            }
+                            false
                         }
+                    };
+                    if response_ended {
+                        if !buf.is_empty() {
+                            match write_block(
+                                &file,
+                                &mut buf,
+                                &ctx.shared,
+                                done,
+                                &ctx.any_written,
+                                &ctx.part_path,
+                            )
+                            .await
+                            {
+                                Ok(d) => done = d,
+                                Err(m) => {
+                                    fatal(ctx, FatalKind::Io(m));
+                                    return;
+                                }
+                            }
+                        }
+                        if done >= len {
+                            complete(ctx);
+                            return;
+                        }
+                        break;
                     }
-                },
+                }
             }
         }
         if !backoff(ctx, attempt).await {
@@ -806,6 +859,8 @@ fn build_progress(run: &RunShared, total: Option<u64>, speed_bps: u64) -> Progre
 
 struct MetaFlushState {
     path: PathBuf,
+    /// The data file the sidecar describes; fsynced before every save.
+    part_path: PathBuf,
     url: String,
     size: u64,
     chunk_size: u64,
@@ -815,21 +870,22 @@ struct MetaFlushState {
 
 struct MonitorCtx {
     run: Arc<RunShared>,
-    events: UnboundedSender<EngineEvent>,
+    events: Sender<EngineEvent>,
     token: CancellationToken,
+    cancelling: Arc<AtomicBool>,
     total: Option<u64>,
     /// None when the total is unknown (no sidecar for this download).
     meta: Option<MetaFlushState>,
 }
 
 /// Aggregate worker counters and serialize the current chunk state.
-fn save_meta_snapshot(
-    path: &Path,
-    url: &str,
-    size: u64,
-    chunk_size: u64,
-    workers: &[Arc<WorkerShared>],
-) -> io::Result<()> {
+/// Freeze the current chunk counters into a sidecar payload.
+///
+/// Called BEFORE the .part fsync on purpose: the payload must describe exactly
+/// the bytes the fsync is about to make durable. Reading the counters afterwards
+/// would claim everything written during the fsync window, and a crash there
+/// leaves done-counts ahead of the data - a resume then skips the holes.
+fn meta_snapshot(url: &str, size: u64, chunk_size: u64, workers: &[Arc<WorkerShared>]) -> MetaFile {
     let chunks: Vec<MetaChunk> = workers
         .iter()
         .map(|w| MetaChunk {
@@ -838,13 +894,12 @@ fn save_meta_snapshot(
             done: w.done.load(Ordering::SeqCst),
         })
         .collect();
-    let m = MetaFile {
+    MetaFile {
         url: url.to_string(),
         size,
         chunk_size,
         chunks,
-    };
-    meta::save_atomic(path, &m)
+    }
 }
 
 /// Same atomically-saved snapshot, executed on a blocking thread (fix #5).
@@ -854,15 +909,44 @@ fn save_meta_snapshot(
 /// progress cadence.
 async fn save_meta_offline(
     path: &Path,
+    part_path: &Path,
     url: &str,
     size: u64,
     chunk_size: u64,
     workers: &[Arc<WorkerShared>],
+    cancelling: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     let path = path.to_path_buf();
+    let part_path = part_path.to_path_buf();
     let url = url.to_string();
+    let cancelling = Arc::clone(cancelling);
     let workers: Vec<Arc<WorkerShared>> = workers.iter().map(Arc::clone).collect();
-    match spawn_blocking(move || save_meta_snapshot(&path, &url, size, chunk_size, &workers)).await
+    match spawn_blocking(move || {
+        // A save that was already inside spawn_blocking when the cancel arrived
+        // must not rename its temp into place afterwards: cancel promises the
+        // sidecar is gone. (Pause must still flush, hence a flag of its own
+        // rather than the cancellation token.)
+        if cancelling.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        // POST-ORDER (the fix that was missing): freeze the counters first, then
+        // make the data durable, then write the claim. The other order - fsync,
+        // then read the counters - claims every byte written during the fsync's
+        // own window, which a crash at that moment silently loses.
+        let snapshot = meta_snapshot(&url, size, chunk_size, &workers);
+        // A failed fsync FAILS the save: the sidecar may not outrun the data.
+        if let Ok(f) = OpenOptions::new().write(true).open(&part_path) {
+            f.sync_data()?;
+        }
+        // Re-check: the cancel can land while the fsync above is running, and a
+        // rename after that point would resurrect the sidecar cancel promised to
+        // delete (N4).
+        if cancelling.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        meta::save_atomic(&path, &snapshot)
+    })
+    .await
     {
         Ok(res) => res,
         Err(e) => Err(join_io_error(e)),
@@ -899,17 +983,19 @@ async fn monitor_task(mut ctx: MonitorCtx) {
                     }
                 }
                 ctx.run.speed_bps.store(speed_bps, Ordering::SeqCst);
-                let _ = ctx.events.send(EngineEvent::Progress(build_progress(&ctx.run, ctx.total, speed_bps)));
+                emit_progress(&ctx.events, build_progress(&ctx.run, ctx.total, speed_bps));
                 if let Some(m) = ctx.meta.as_mut() {
                     // At most one atomic sidecar save per second, and off the
                     // runtime: the serialize+sync+rename write is blocking.
                     if m.last_dones != dones && now.duration_since(m.last_flush) >= FLUSH_INTERVAL {
                         let saved = save_meta_offline(
                             &m.path,
+                            &m.part_path,
                             &m.url,
                             m.size,
                             m.chunk_size,
                             &ctx.run.workers,
+                            &ctx.cancelling,
                         )
                         .await
                         .is_ok();
@@ -929,6 +1015,10 @@ struct Active {
     handles: Vec<JoinHandle<()>>,
     msgs_rx: UnboundedReceiver<WorkerMsg>,
     completed: usize,
+    /// Shared "the user cancelled" flag. It lives on the run rather than being
+    /// threaded separately because it describes the run's lifecycle, and the
+    /// token cannot serve: the token is also cancelled on pause, which must flush.
+    cancelling: Arc<AtomicBool>,
 }
 
 fn build_run(plan: &Plan) -> RunShared {
@@ -960,8 +1050,9 @@ fn spawn_all(
     spec: &DownloadSpec,
     plan: &Plan,
     run: &Arc<RunShared>,
-    events: &UnboundedSender<EngineEvent>,
+    events: &Sender<EngineEvent>,
     token: &CancellationToken,
+    cancelling: &Arc<AtomicBool>,
 ) -> Active {
     let (msgs_tx, msgs_rx) = unbounded_channel();
     let client = super::http_client();
@@ -982,6 +1073,7 @@ fn spawn_all(
     }
     let monitor_meta = plan.size.map(|size| MetaFlushState {
         path: spec.meta_path.clone(),
+        part_path: spec.part_path.clone(),
         url: spec.url.clone(),
         size,
         chunk_size: plan.chunk_size,
@@ -996,6 +1088,7 @@ fn spawn_all(
         run: Arc::clone(run),
         events: events.clone(),
         token: token.clone(),
+        cancelling: Arc::clone(cancelling),
         total: plan.size,
         meta: monitor_meta,
     })));
@@ -1004,6 +1097,7 @@ fn spawn_all(
         handles,
         msgs_rx,
         completed: 0,
+        cancelling: Arc::clone(cancelling),
     }
 }
 
@@ -1024,17 +1118,53 @@ async fn join_bounded(handles: &mut [JoinHandle<()>], budget: Duration) {
 
 /// Flush the sidecar from the current worker counters (known size only), off
 /// the runtime so a pause/cleanup flush cannot stall the event loop.
-async fn flush_meta(spec: &DownloadSpec, plan: &Plan, run: &RunShared) {
-    if let Some(size) = plan.size {
-        let _ = save_meta_offline(
-            &spec.meta_path,
-            &spec.url,
-            size,
-            plan.chunk_size,
-            &run.workers,
-        )
-        .await;
+async fn flush_meta(
+    spec: &DownloadSpec,
+    plan: &Plan,
+    run: &RunShared,
+    cancelling: &Arc<AtomicBool>,
+) -> io::Result<()> {
+    match plan.size {
+        // No sidecar exists for an unknown total, so nothing can fail.
+        None => Ok(()),
+        Some(size) => {
+            save_meta_offline(
+                &spec.meta_path,
+                &spec.part_path,
+                &spec.url,
+                size,
+                plan.chunk_size,
+                &run.workers,
+                cancelling,
+            )
+            .await
+        }
     }
+}
+
+/// If a Cancel is queued, honour it now: mark the run cancelled, delete the
+/// partial and the sidecar (sweeping to a bounded depth), ack the caller and say
+/// so. Returns true when the run was cancelled and the caller must stop.
+///
+/// Called at every point of no return in `finalize`, because a cancel that lands
+/// while the completion path is syncing or verifying must still either win
+/// cleanly or be reported as too late - never be dropped on the floor.
+async fn honour_pending_cancel(
+    spec: &DownloadSpec,
+    ctrl_rx: &mut UnboundedReceiver<Ctrl>,
+    cancelling: &Arc<AtomicBool>,
+) -> bool {
+    while let Ok(pending) = ctrl_rx.try_recv() {
+        if let Ctrl::Cancel(ack) = pending {
+            cancelling.store(true, Ordering::SeqCst);
+            cleanup_cancel(spec).await;
+            if let Some(tx) = ack {
+                let _ = tx.send(());
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// Cancel_download cleanup: delete the partial bytes and the sidecar.
@@ -1105,14 +1235,22 @@ async fn finalize(
     spec: &DownloadSpec,
     plan: &Plan,
     run: &RunShared,
-    events: &UnboundedSender<EngineEvent>,
+    events: &Sender<EngineEvent>,
     active: &mut Active,
     coord: &Arc<File>,
+    ctrl_rx: &mut UnboundedReceiver<Ctrl>,
 ) {
     active.token.cancel();
     join_bounded(&mut active.handles, Duration::from_secs(1)).await;
+
+    // A cancel queued while the workers were being joined wins here: nothing has
+    // been renamed yet, so "delete it" is still unambiguous.
+    let cancelling = Arc::clone(&active.cancelling);
+    if honour_pending_cancel(spec, ctrl_rx, &cancelling).await {
+        return;
+    }
     let speed = run.speed_bps.load(Ordering::SeqCst);
-    let _ = events.send(EngineEvent::Progress(build_progress(run, plan.size, speed)));
+    emit_progress(events, build_progress(run, plan.size, speed));
 
     // fsync of a fully dirty multi-GiB file, off the runtime (fix #5). The
     // ORDER is unchanged: the data is durable before anything is verified or
@@ -1127,7 +1265,7 @@ async fn finalize(
     if let Err(e) = durable {
         let mut s = state_payload("error");
         s.message = Some(io_error(&e, &spec.part_path));
-        emit_state(events, s);
+        emit_state(events, s).await;
         return;
     }
 
@@ -1139,7 +1277,7 @@ async fn finalize(
     if let Err(message) = verify_complete(plan.size, &run.workers) {
         let mut s = state_payload("error");
         s.message = Some(message);
-        emit_state(events, s);
+        emit_state(events, s).await;
         return;
     }
     // Defense in depth for a known size: the file must also still be exactly
@@ -1151,7 +1289,7 @@ async fn finalize(
         Err(e) => {
             let mut s = state_payload("error");
             s.message = Some(io_error(&e, &spec.part_path));
-            emit_state(events, s);
+            emit_state(events, s).await;
             return;
         }
     };
@@ -1159,15 +1297,32 @@ async fn finalize(
         if part_len != expected {
             let mut s = state_payload("error");
             s.message = Some(mismatch_message(expected, part_len));
-            emit_state(events, s);
+            emit_state(events, s).await;
             return;
         }
     }
-    let target = unique_target(&spec.final_path);
+    // Last chance: the sync and the byte verification above can take seconds on a
+    // multi-GiB file, and a cancel that arrives during them must still win while
+    // the bytes are a .part. After the rename below it is genuinely too late.
+    if honour_pending_cancel(spec, ctrl_rx, &cancelling).await {
+        return;
+    }
+
+    let target = match unique_target(&spec.final_path) {
+        Ok(t) => t,
+        Err(e) => {
+            let mut s = state_payload("error");
+            s.message = Some(io_error(&e, &spec.final_path));
+            emit_state(events, s).await;
+            return;
+        }
+    };
     if let Err(e) = fs::rename(&spec.part_path, &target) {
+        // Do not leave the empty reservation behind.
+        let _ = fs::remove_file(&target);
         let mut s = state_payload("error");
         s.message = Some(io_error(&e, &spec.final_path));
-        emit_state(events, s);
+        emit_state(events, s).await;
         return;
     }
     let _ = fs::remove_file(&spec.meta_path);
@@ -1175,14 +1330,15 @@ async fn finalize(
     let mut s = state_payload("done");
     s.path = Some(target.to_string_lossy().into_owned());
     s.size = Some(final_size);
-    emit_state(events, s);
+    emit_state(events, s).await;
 }
 
-/// First free rename target: "<stem> (k)<ext>" for k = 2, 3, ...
-pub fn unique_target(final_path: &Path) -> PathBuf {
-    if !final_path.exists() {
-        return final_path.to_path_buf();
-    }
+/// Reserve the first free rename target: "<stem> (k)<ext>" for k = 2, 3, ...
+///
+/// The candidate is reserved with O_CREAT|O_EXCL rather than tested with
+/// exists(): two concurrent completions can no longer pick the same name and
+/// one overwrite the other. The caller renames over the reservation it owns.
+pub fn unique_target(final_path: &Path) -> io::Result<PathBuf> {
     let parent = final_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -1195,20 +1351,30 @@ pub fn unique_target(final_path: &Path) -> PathBuf {
         .extension()
         .map(|e| format!(".{}", e.to_string_lossy()))
         .unwrap_or_default();
-    for k in 2u64.. {
-        let cand = parent.join(format!("{} ({}){}", stem, k, ext));
-        if !cand.exists() {
-            return cand;
+    // k = 1 is the plain name; k >= 2 carries the " (k)" suffix (CONTRACT).
+    for k in 1u64..=1_000_000 {
+        let cand = if k == 1 {
+            final_path.to_path_buf()
+        } else {
+            parent.join(format!("{} ({}){}", stem, k, ext))
+        };
+        match OpenOptions::new().write(true).create_new(true).open(&cand) {
+            Ok(_) => return Ok(cand),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
     }
-    final_path.to_path_buf()
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free name for the finished file",
+    ))
 }
 
 /// The engine supervisor: owns the whole download lifecycle and reports every
 /// state change through the event channel. Never touches an AppHandle.
 pub async fn run(
     spec: DownloadSpec,
-    events: UnboundedSender<EngineEvent>,
+    events: Sender<EngineEvent>,
     mut ctrl_rx: UnboundedReceiver<Ctrl>,
 ) {
     // ---- plan: sidecar resume or fresh ----
@@ -1226,7 +1392,7 @@ pub async fn run(
         Err(e) => {
             let mut s = state_payload("error");
             s.message = Some(io_error(&e, &spec.part_path));
-            emit_state(&events, s);
+            emit_state(&events, s).await;
             return;
         }
     };
@@ -1234,7 +1400,7 @@ pub async fn run(
         if let Err(e) = coord.set_len(len) {
             let mut s = state_payload("error");
             s.message = Some(io_error(&e, &spec.part_path));
-            emit_state(&events, s);
+            emit_state(&events, s).await;
             return;
         }
     }
@@ -1243,13 +1409,23 @@ pub async fn run(
     // ---- first state event + initial sidecar ----
     let mut s = state_payload("downloading");
     s.note = note;
-    emit_state(&events, s);
-    flush_meta(&spec, &plan, &run).await;
+    emit_state(&events, s).await;
 
     let mut token = CancellationToken::new();
-    let mut active = spawn_all(&spec, &plan, &run, &events, &token);
+    let cancelling = Arc::new(AtomicBool::new(false));
+    let _ = flush_meta(&spec, &plan, &run, &cancelling).await;
+    let mut active = spawn_all(&spec, &plan, &run, &events, &token, &cancelling);
     if run.workers.is_empty() {
-        finalize(&spec, &plan, &run, &events, &mut active, &coord).await;
+        finalize(
+            &spec,
+            &plan,
+            &run,
+            &events,
+            &mut active,
+            &coord,
+            &mut ctrl_rx,
+        )
+        .await;
         return;
     }
 
@@ -1260,11 +1436,15 @@ pub async fn run(
                 Some(Ctrl::Resume) => {
                     paused = false;
                     token = CancellationToken::new();
-                    emit_state(&events, state_payload("downloading"));
-                    active = spawn_all(&spec, &plan, &run, &events, &token);
+                    emit_state(&events, state_payload("downloading")).await;
+                    active = spawn_all(&spec, &plan, &run, &events, &token, &cancelling);
                 }
-                Some(Ctrl::Cancel) => {
+                Some(Ctrl::Cancel(ack)) => {
+                    cancelling.store(true, Ordering::SeqCst);
                     cleanup_cancel(&spec).await;
+                    if let Some(tx) = ack {
+                        let _ = tx.send(());
+                    }
                     return;
                 }
                 Some(Ctrl::Pause) => {}
@@ -1280,7 +1460,7 @@ pub async fn run(
             Fatal(FatalKind),
             WorkersGone,
             Pause,
-            Cancel,
+            Cancel(Option<oneshot::Sender<()>>),
             Resume,
             Gone,
         }
@@ -1288,7 +1468,7 @@ pub async fn run(
             biased;
             ctrl = ctrl_rx.recv() => match ctrl {
                 Some(Ctrl::Pause) => Next::Pause,
-                Some(Ctrl::Cancel) => Next::Cancel,
+                Some(Ctrl::Cancel(ack)) => Next::Cancel(ack),
                 Some(Ctrl::Resume) => Next::Resume,
                 None => Next::Gone,
             },
@@ -1306,35 +1486,57 @@ pub async fn run(
                 // All workers exited without completing or failing.
                 let mut s = state_payload("error");
                 s.message = Some("engine stopped unexpectedly".into());
-                emit_state(&events, s);
+                emit_state(&events, s).await;
                 return;
             }
             Next::Completed => {
                 active.completed += 1;
                 if active.completed >= run.workers.len() {
-                    finalize(&spec, &plan, &run, &events, &mut active, &coord).await;
+                    finalize(
+                        &spec,
+                        &plan,
+                        &run,
+                        &events,
+                        &mut active,
+                        &coord,
+                        &mut ctrl_rx,
+                    )
+                    .await;
                     return;
                 }
             }
             Next::Pause => {
                 active.token.cancel();
                 join_bounded(&mut active.handles, JOIN_BUDGET).await;
-                flush_meta(&spec, &plan, &run).await;
+                // The UI is about to say "offsets saved": only claim that when
+                // the sidecar really reached the disk.
+                if let Err(e) = flush_meta(&spec, &plan, &run, &cancelling).await {
+                    let mut s = state_payload("error");
+                    s.message = Some(io_error(&e, &spec.meta_path));
+                    emit_state(&events, s).await;
+                    return;
+                }
                 let speed = run.speed_bps.load(Ordering::SeqCst);
-                let _ = events.send(EngineEvent::Progress(build_progress(
-                    &run, plan.size, speed,
-                )));
-                emit_state(&events, state_payload("paused"));
+                emit_progress(&events, build_progress(&run, plan.size, speed));
+                emit_state(&events, state_payload("paused")).await;
                 paused = true;
             }
-            Next::Cancel => {
+            Next::Cancel(ack) => {
+                cancelling.store(true, Ordering::SeqCst);
                 active.token.cancel();
                 join_bounded(&mut active.handles, ERROR_JOIN_BUDGET).await;
                 cleanup_cancel(&spec).await;
+                // Only now are the files really gone, so only now may the caller
+                // be told the cancel succeeded.
+                if let Some(tx) = ack {
+                    let _ = tx.send(());
+                }
                 return;
             }
             Next::Fatal(kind) => match kind {
-                FatalKind::RefusedRangesStart if !plan.single && plan.size.is_some() => {
+                FatalKind::RefusedRangesStart
+                    if !plan.single && plan.size.is_some() && !plan.resumed =>
+                {
                     // GRACEFUL FALLBACK (CONTRACT): nothing written yet -> stop
                     // everyone, truncate the .part, switch to a single
                     // sequential connection, persist the meta, re-announce.
@@ -1343,25 +1545,29 @@ pub async fn run(
                     if let Err(e) = coord.set_len(0) {
                         let mut s = state_payload("error");
                         s.message = Some(io_error(&e, &spec.part_path));
-                        emit_state(&events, s);
+                        emit_state(&events, s).await;
                         return;
                     }
                     plan = Plan::single(plan.size);
                     run = Arc::new(build_run(&plan));
-                    flush_meta(&spec, &plan, &run).await;
+                    let _ = flush_meta(&spec, &plan, &run, &cancelling).await;
                     let mut s = state_payload("downloading");
                     s.note =
                         Some("server refused range requests - using a single connection".into());
-                    emit_state(&events, s);
+                    emit_state(&events, s).await;
                     token = CancellationToken::new();
-                    active = spawn_all(&spec, &plan, &run, &events, &token);
+                    active = spawn_all(&spec, &plan, &run, &events, &token, &cancelling);
                 }
                 kind => {
                     active.token.cancel();
                     join_bounded(&mut active.handles, ERROR_JOIN_BUDGET).await;
+                    // Deliberately no cleanup here: the .part and the sidecar are
+                    // what "Try again" and a later resume continue from, and this
+                    // engine may already have written gigabytes of them. Cancel is
+                    // the explicit "throw it away" action (see cleanup_cancel).
                     let mut s = state_payload("error");
                     s.message = Some(kind.message());
-                    emit_state(&events, s);
+                    emit_state(&events, s).await;
                     return;
                 }
             },
@@ -1414,25 +1620,54 @@ mod tests {
     }
 
     #[test]
-    fn unique_target_naming() {
+    fn unique_target_reserves_a_free_name() {
         let dir = temp_dir("unique");
         let target = dir.join("movie.mkv");
-        assert_eq!(unique_target(&target), target);
 
-        fs::write(&target, b"x").unwrap();
-        let t2 = unique_target(&target);
+        // The first call reserves the plain name (creating an empty placeholder),
+        // so the caller owns it before the rename happens.
+        let t1 = unique_target(&target).unwrap();
+        assert_eq!(t1, target);
+        assert!(t1.exists(), "the reservation must exist atomically");
+
+        // A second completion cannot be handed the same name.
+        let t2 = unique_target(&target).unwrap();
         assert_eq!(t2, dir.join("movie (2).mkv"));
+        assert!(t2.exists());
 
-        fs::write(&t2, b"x").unwrap();
-        assert_eq!(unique_target(&target), dir.join("movie (3).mkv"));
+        let t3 = unique_target(&target).unwrap();
+        assert_eq!(t3, dir.join("movie (3).mkv"));
 
+        // Extension-less and multi-dot names keep their shape.
         let plain = dir.join("README");
-        fs::write(&plain, b"x").unwrap();
-        assert_eq!(unique_target(&plain), dir.join("README (2)"));
+        assert_eq!(unique_target(&plain).unwrap(), plain);
+        assert_eq!(unique_target(&plain).unwrap(), dir.join("README (2)"));
 
         let archive = dir.join("a.tar.gz");
-        fs::write(&archive, b"x").unwrap();
-        assert_eq!(unique_target(&archive), dir.join("a.tar (2).gz"));
+        assert_eq!(unique_target(&archive).unwrap(), archive);
+        assert_eq!(unique_target(&archive).unwrap(), dir.join("a.tar (2).gz"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_target_is_exclusive_under_contention() {
+        let dir = temp_dir("unique-race");
+        let target = dir.join("race.bin");
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let t = target.clone();
+            handles.push(std::thread::spawn(move || unique_target(&t).unwrap()));
+        }
+        let mut names: Vec<PathBuf> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            8,
+            "every concurrent finish must reserve its own name"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

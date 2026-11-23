@@ -7,20 +7,26 @@
 #   scripts/acceptance.sh <REF_URL>  # run against a different reference target
 #
 # Stages (each prints PASS/FAIL; final summary table + ACCEPTANCE: PASS|FAIL):
-#   0 build         - cargo build --release --example speedtest
-#   1 throughput    - 4-conn avg_mibps >= 25.0 (+ single-conn, informational)
-#   2 resume        - 512 MiB fresh vs paused(6s)-then-resumed, shasum equality
-#   3 norange       - server ignores Range -> single-stream fallback (single=1)
-#   4 head-reject   - HEAD 405 + 206 ranged GETs -> multi-conn ranged download
-#   5 flaky         - mid-body drops at p=0.2 -> retries must converge
-#   6 unit          - cargo test
+#   0  build           - cargo build --release --example speedtest
+#   1  throughput      - 4-conn avg_mibps >= 25.0 (+ single-conn, informational)
+#   2  resume          - 512 MiB fresh vs paused(6s)-then-resumed, shasum equality
+#   3  norange         - server ignores Range -> single-stream fallback (single=1)
+#   4  head-reject     - HEAD 405 + 206 ranged GETs -> multi-conn ranged download
+#   5  flaky           - mid-body drops at p=0.2 -> retries must converge
+#   6  cancel-cleanup  - throttled run cancels itself -> .part/sidecar/tmp deleted
+#   7  oversend-bytecap - a 206 longer than its Content-Range must not corrupt
+#   8  stall-timeout   - silence is retried at the 30 s deadline (two-sided bound)
+#   9  probe-verify    - HEAD 200 without Accept-Ranges is upgraded by a GET
+#   10 unknown-size    - no Content-Length -> one stream, no sidecar
+#   11 unit            - cargo test
 #
 # Needs: cargo, python3, shasum, awk (base macOS tools; no GNU timeout needed).
-# All temp state lives under /tmp/hydra-acc/ and is removed by the cleanup
-# trap, which also kills every testserver this script started. Every speedtest
-# run is wrapped in a watchdog so the harness can never hang. Exit status is
-# 0 iff the final line is ACCEPTANCE: PASS. If stage 0 fails, the run stops
-# early (nothing else can execute) but still prints the summary table.
+# Temp state lives in a mktemp -d directory created by this script and removed by
+# the cleanup trap, which also kills every testserver it started; set
+# HYDRA_ACC_DIR to keep the artefacts (that directory is then NOT removed). Every
+# speedtest run is wrapped in a watchdog so the harness can never hang. Exit
+# status is 0 iff the final line is ACCEPTANCE: PASS. If stage 0 fails the run
+# stops early (nothing else can execute) but still prints the summary table.
 # =============================================================================
 set -euo pipefail
 
@@ -34,7 +40,18 @@ SPEEDTEST="$ROOT/src-tauri/target/release/examples/speedtest"
 # Reference target from CONTRACT.md ("Reference test target" section).
 DEFAULT_REF_URL="${HYDRA_REF_URL:-}"  # no reference target committed; export HYDRA_REF_URL to enable the CDN stages
 
-ACC_DIR="/tmp/hydra-acc"
+# A fresh directory every run: a stale one from a killed run would otherwise
+# let the throughput stage 'download' a leftover partial, and a squatted
+# symlink at a predictable path is a clobber risk. mktemp -d is 0700.
+# HYDRA_ACC_DIR keeps the artefacts instead - and is then NOT deleted on exit.
+ACC_DIR_OWNED=1
+if [ -n "${HYDRA_ACC_DIR:-}" ]; then
+  ACC_DIR="$HYDRA_ACC_DIR"
+  ACC_DIR_OWNED=0
+  mkdir -p "$ACC_DIR"
+else
+  ACC_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hydra-acc.XXXXXX")"
+fi
 RUN_LOG="$ACC_DIR/last-run.log"
 TESTFILE="$ACC_DIR/test64.bin"
 SRC_SHA=""
@@ -45,6 +62,8 @@ PORT_FLAKY=""
 PORT_CANCEL=""
 PORT_OVERSEND=""
 PORT_STALL=""
+PORT_PROBE=""
+PORT_NOLEN=""
 SERVER_PIDS=""                 # space-separated pids of testserver instances
 
 STAGE_NAMES=()
@@ -92,7 +111,11 @@ kill_servers() {
 
 cleanup() {
   kill_servers
-  rm -rf "$ACC_DIR"
+  # Only remove a directory this script created: an explicit HYDRA_ACC_DIR may
+  # be a real directory the caller wanted to keep.
+  if [ "${ACC_DIR_OWNED:-1}" = "1" ]; then
+    rm -rf "$ACC_DIR"
+  fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -337,8 +360,11 @@ stage_resume() {
   REF_SHA="$(sha_of "$data")"
   note "fresh 512MiB ok sha=$REF_SHA"
 
-  # (b) wipe .part + sidecar meta so the next run starts fresh
-  rm -f "$out" "$out.hydra.json" "$meta"
+  # (b) wipe .part + sidecar AND the completed file from step (a). Without the
+  # last one the resumed run renames to "full (2)" while data_file() keeps
+  # returning the old "full", so the sha comparison would compare the step-(a)
+  # file with itself and pass no matter what the resume actually produced.
+  rm -f "$out" "$out.hydra.json" "$meta" "${out%.part}" "${out%.part} (2)"
   if [ -e "$out" ] || [ -e "$meta" ]; then
     note "could not delete $out / $meta"
     return 1
@@ -530,7 +556,11 @@ flaky_checks() {
     note "shasum mismatch: src=$SRC_SHA got=$sha"
     return 1
   fi
-  note "ok=1 single=$single sha=match port=$PORT_FLAKY (drop_p=0.2)"
+  if [ "$single" != "0" ]; then
+    note "single=$single != 0 (flaky stage must exercise the ranged path)"
+    return 1
+  fi
+  note "ok=1 single=0 sha=match port=$PORT_FLAKY (drop_p=0.2)"
   return 0
 }
 
@@ -545,14 +575,14 @@ stage_flaky() {
 
 cancel_checks() {
   local url="$1"
-  local dir="$ACC_DIR/cancel"
+  # A throwaway subdirectory of the scratch dir: never rm -rf a path that could
+  # be the caller's (HYDRA_ACC_DIR may point at a real directory).
+  local dir
+  dir="$(mktemp -d "$ACC_DIR/cancel.XXXXXX")"
   local out="$dir/cancel.bin.part"
   local meta="$dir/cancel.bin.hydra.json"
   local tmpp="$meta.tmp"
   local midway="" bytes="" rc=0 waited=0 pid
-
-  rm -rf "$dir"
-  mkdir -p "$dir"
   # Throttled run that cancels itself after 3 s, in the background so we can
   # first prove the partials really exist on disk.
   "$SPEEDTEST" "$url" 4 67108864 "$out" 0 3 >"$ACC_DIR/cancel.log" 2>&1 &
@@ -619,7 +649,11 @@ oversend_checks() {
     note "shasum mismatch - over-sent bytes spilled into the file: src=$SRC_SHA got=$sha"
     return 1
   fi
-  note "ok=1 single=$single sha=match port=$PORT_OVERSEND (+64KiB per 206)"
+  if [ "$single" != "0" ]; then
+    note "single=$single != 0 (oversend stage must exercise the ranged path)"
+    return 1
+  fi
+  note "ok=1 single=0 sha=match port=$PORT_OVERSEND (+64KiB per 206)"
   return 0
 }
 
@@ -654,17 +688,95 @@ stall_checks() {
     note "shasum mismatch: src=$SRC_SHA got=$sha"
     return 1
   fi
-  if [ "$elapsed" -lt 25 ]; then
-    note "finished in ${elapsed}s - the 30 s idle timeout never fired"
+  # Two-sided: the deadline is 30 s, so a timeout that really fired lands near
+  # 31 s. A lower bound alone would also pass if the client had NO timeout and
+  # merely waited for the server to close at 45 s, which is the whole point.
+  if [ "$elapsed" -lt 28 ] || [ "$elapsed" -gt 42 ]; then
+    note "elapsed=${elapsed}s outside 28-42 s: the 30 s read deadline did not fire"
     return 1
   fi
-  note "ok=1 sha=match elapsed=${elapsed}s (idle timeout fired, retry converged)"
+  note "ok=1 sha=match elapsed=${elapsed}s (deadline fired at 30 s, retry converged)"
   return 0
 }
 
 stage_stall() {
   local rc=1
   if prep_testfile && start_server stall "$PORT_STALL" "$TESTFILE" && stall_checks "http://127.0.0.1:$PORT_STALL/"; then
+    rc=0
+  fi
+  kill_servers
+  return "$rc"
+}
+
+# ---- probe verification: HEAD 200 without Accept-Ranges must still go wide ---
+probe_verify_checks() {
+  local url="$1" out=""
+  if ! "$SPEEDTEST" --probe "$url" >"$ACC_DIR/probe.log" 2>&1; then
+    note "probe-only run failed: $(tail -1 "$ACC_DIR/probe.log" 2>/dev/null)"
+    return 1
+  fi
+  out="$(tr "\n" " " <"$ACC_DIR/probe.log")"
+  case "$out" in
+    *"acceptsRanges=true"*) ;;
+    *) note "range verification did not upgrade: $out"; return 1 ;;
+  esac
+  case "$out" in
+    *"method=range"*) ;;
+    *) note "probeMethod should be range when the GET decided: $out"; return 1 ;;
+  esac
+  case "$out" in
+    *"size=67108864"*) ;;
+    *) note "size was not learned from HEAD: $out"; return 1 ;;
+  esac
+  note "HEAD omitted Accept-Ranges; verification GET upgraded to multi-connection"
+  return 0
+}
+
+stage_probe_verify() {
+  local rc=1
+  if prep_testfile && start_server noadvertise "$PORT_PROBE" "$TESTFILE" && probe_verify_checks "http://127.0.0.1:$PORT_PROBE/"; then
+    rc=0
+  fi
+  kill_servers
+  return "$rc"
+}
+
+# ---- unknown size: size=null must run as one sequential stream, no sidecar ---
+unknown_size_checks() {
+  local url="$1"
+  local out="$ACC_DIR/unknown.bin.part"
+  local ok single data sha
+  if ! run_speed 240 "$url" 4 67108864 "$out" 0; then
+    note "unknown-size run failed or timed out"
+    return 1
+  fi
+  ok="$(summary_get "$RUN_LOG" ok)"
+  if [ "$ok" != "1" ]; then
+    note "SUMMARY ok=$ok error=$(summary_error "$RUN_LOG")"
+    return 1
+  fi
+  single="$(summary_get "$RUN_LOG" single)"
+  if [ "$single" != "1" ]; then
+    note "unknown size must be a single stream, got single=$single"
+    return 1
+  fi
+  if [ -e "$ACC_DIR/unknown.bin.hydra.json" ]; then
+    note "a sidecar was written for an unknown-size run (CONTRACT: none)"
+    return 1
+  fi
+  data="$(data_file "$out")" || { note "no data file at $out"; return 1; }
+  sha="$(sha_of "$data")"
+  if [ "$sha" != "$SRC_SHA" ]; then
+    note "shasum mismatch: src=$SRC_SHA got=$sha"
+    return 1
+  fi
+  note "single=1 sha=match no sidecar"
+  return 0
+}
+
+stage_unknown_size() {
+  local rc=1
+  if prep_testfile && start_server nolength "$PORT_NOLEN" "$TESTFILE" && unknown_size_checks "http://127.0.0.1:$PORT_NOLEN/"; then
     rc=0
   fi
   kill_servers
@@ -737,7 +849,11 @@ else
   echo "  ref url   : (unset - CDN stages 1-2 will SKIP; export HYDRA_REF_URL)"
 fi
 echo "  speedtest : $SPEEDTEST"
-echo "  temp dir  : $ACC_DIR (removed on exit)"
+if [ "${ACC_DIR_OWNED:-1}" = "1" ]; then
+  echo "  temp dir  : $ACC_DIR (removed on exit)"
+else
+  echo "  temp dir  : $ACC_DIR (HYDRA_ACC_DIR - KEPT on exit)"
+fi
 
 # preflight
 for cmd in python3 shasum awk; do
@@ -758,6 +874,8 @@ PORT_FLAKY="$(pick_port)"
 PORT_CANCEL="$(pick_port)"
 PORT_OVERSEND="$(pick_port)"
 PORT_STALL="$(pick_port)"
+PORT_PROBE="$(pick_port)"
+PORT_NOLEN="$(pick_port)"
 
 run_stage "0 build" stage_build
 if [ "${STAGE_RESULTS[0]}" = "FAIL" ]; then
@@ -774,7 +892,9 @@ run_stage "5 flaky-retry" stage_flaky
 run_stage "6 cancel-cleanup" stage_cancel
 run_stage "7 oversend-bytecap" stage_oversend
 run_stage "8 stall-timeout" stage_stall
-run_stage "9 unit" stage_unit
+run_stage "9 probe-verify" stage_probe_verify
+run_stage "10 unknown-size" stage_unknown_size
+run_stage "11 unit" stage_unit
 
 print_summary
 exit "$STAGE_FAIL"

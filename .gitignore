@@ -7,3 +7,6 @@ src-tauri/gen/schemas/
 tmp/
 
 .impeccable/
+
+# agent-to-agent coordination file (working note, not part of the project)
+agent-communications.md
