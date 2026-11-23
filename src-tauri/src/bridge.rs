@@ -11,7 +11,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::engine::settings::Settings;
 use crate::engine::types::{EngineEvent, ProbeInfo, ProgressPayload, StatePayload};
@@ -32,7 +32,10 @@ struct Handle {
 
 impl Registry {
     pub fn new() -> Self {
-        Registry { inner: Mutex::new(HashMap::new()), next: AtomicU64::new(1) }
+        Registry {
+            inner: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(1),
+        }
     }
 
     fn alloc_id(&self) -> String {
@@ -85,12 +88,6 @@ pub struct MetaCheck {
 }
 
 // ----------------------------------------------------------------- commands
-
-/// Smoke-test command kept from the original scaffold.
-#[tauri::command]
-pub fn hydra_ping() -> &'static str {
-    "pong"
-}
 
 /// CONTRACT probe_url.
 #[tauri::command]
@@ -199,7 +196,8 @@ pub async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
             .map(|p| p.to_string_lossy().into_owned());
         let _ = tx.send(out);
     });
-    rx.await.map_err(|_| "could not open folder picker".to_string())
+    rx.await
+        .map_err(|_| "could not open folder picker".to_string())
 }
 
 /// CONTRACT reveal_path: Finder reveal of the item.
@@ -228,9 +226,14 @@ pub async fn save_settings(
 ) -> Result<(), String> {
     let path = settings_path(&app);
     let mut current = engine::settings::load(&path);
-    engine::settings::apply(&mut current, dest_dir, connections.map(|c| c as u32));
-    engine::settings::save(&path, &current)
-        .map_err(|e| format!("could not save settings: {}", e))
+    // clamp in u64 first: casting a huge value to u32 would wrap before the
+    // clamp ever saw it
+    engine::settings::apply(
+        &mut current,
+        dest_dir,
+        connections.map(|c| c.clamp(1, 16) as u32),
+    );
+    engine::settings::save(&path, &current).map_err(|e| format!("could not save settings: {}", e))
 }
 
 /// CONTRACT meta_check: whether a resumable sidecar matching url+size exists.
@@ -242,23 +245,44 @@ pub async fn meta_check(
     size: Option<u64>,
 ) -> Result<MetaCheck, String> {
     let dir = PathBuf::from(dest_dir);
+    // same sanitizer as start_download: a crafted filename must not be able to
+    // point the sidecar lookup outside the destination directory
+    let filename = names::sanitize_filename(&filename);
     let meta_path = dir.join(format!("{}.hydra.json", filename));
     let part_path = dir.join(format!("{}.part", filename));
     if !meta_path.exists() || !part_path.exists() {
-        return Ok(MetaCheck { exists: false, compatible: false, bytes_done: 0 });
+        return Ok(MetaCheck {
+            exists: false,
+            compatible: false,
+            bytes_done: 0,
+        });
     }
     let size = match size {
         Some(s) => s,
-        None => return Ok(MetaCheck { exists: true, compatible: false, bytes_done: 0 }),
+        None => {
+            return Ok(MetaCheck {
+                exists: true,
+                compatible: false,
+                bytes_done: 0,
+            })
+        }
     };
     match engine::meta::load(&meta_path) {
         Some(mut m) if engine::meta::is_compatible(&m, &url, size) => {
             let part_len = std::fs::metadata(&part_path).map(|s| s.len()).unwrap_or(0);
             engine::meta::clamp_dones(&mut m, part_len);
             let done = engine::meta::bytes_done(&m);
-            Ok(MetaCheck { exists: true, compatible: true, bytes_done: done })
+            Ok(MetaCheck {
+                exists: true,
+                compatible: true,
+                bytes_done: done,
+            })
         }
-        _ => Ok(MetaCheck { exists: true, compatible: false, bytes_done: 0 }),
+        _ => Ok(MetaCheck {
+            exists: true,
+            compatible: false,
+            bytes_done: 0,
+        }),
     }
 }
 
@@ -272,14 +296,26 @@ fn spawn_forwarder(app: AppHandle, id: String, mut rx: UnboundedReceiver<EngineE
             match ev {
                 EngineEvent::State(s) => {
                     let terminal = s.terminal();
-                    let _ = app.emit("hydra://state", WireState { id: id.clone(), inner: s });
+                    let _ = app.emit(
+                        "hydra://state",
+                        WireState {
+                            id: id.clone(),
+                            inner: s,
+                        },
+                    );
                     if terminal {
                         app.state::<Registry>().remove(&id);
                         break;
                     }
                 }
                 EngineEvent::Progress(p) => {
-                    let _ = app.emit("hydra://progress", WireProgress { id: id.clone(), inner: p });
+                    let _ = app.emit(
+                        "hydra://progress",
+                        WireProgress {
+                            id: id.clone(),
+                            inner: p,
+                        },
+                    );
                 }
             }
         }
@@ -293,8 +329,27 @@ fn settings_path(app: &AppHandle) -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("settings.json"))
 }
 
-/// destination check: an existing directory we can create files in. Human
-/// lowercase error strings per CONTRACT.
+/// Destination check: an existing directory we can create files in. Human
+/// lowercase error strings per CONTRACT, produced by the shared error mapper so
+/// a disk-full or permission failure reads the same here as it does mid-transfer.
+fn check_writable(dir: &std::path::Path) -> Result<(), String> {
+    match std::fs::metadata(dir) {
+        Err(_) => return Err(format!("destination is not writable: {}", dir.display())),
+        Ok(md) if !md.is_dir() => {
+            return Err(format!("destination is not writable: {}", dir.display()));
+        }
+        Ok(_) => {}
+    }
+    let probe = dir.join(".hydra-write-probe");
+    match std::fs::File::create(&probe) {
+        Err(e) => Err(engine::errors::write_error(Some(dir), &e)),
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,7 +361,11 @@ mod tests {
         let mut s = state_like("done");
         s.path = Some("/dl/movie.mkv".into());
         s.size = Some(7772412965);
-        let json = serde_json::to_string(&WireState { id: "dl-1".into(), inner: s }).unwrap();
+        let json = serde_json::to_string(&WireState {
+            id: "dl-1".into(),
+            inner: s,
+        })
+        .unwrap();
         assert_eq!(
             json,
             r#"{"id":"dl-1","state":"done","path":"/dl/movie.mkv","size":7772412965}"#
@@ -314,16 +373,31 @@ mod tests {
         // error: id + state + message
         let mut e = state_like("error");
         e.message = Some("HTTP 403".into());
-        let j = serde_json::to_string(&WireState { id: "dl-2".into(), inner: e }).unwrap();
+        let j = serde_json::to_string(&WireState {
+            id: "dl-2".into(),
+            inner: e,
+        })
+        .unwrap();
         assert_eq!(j, r#"{"id":"dl-2","state":"error","message":"HTTP 403"}"#);
         // downloading with optional note
         let mut d = state_like("downloading");
         d.note = Some("Resuming partial download".into());
-        let j = serde_json::to_string(&WireState { id: "dl-3".into(), inner: d }).unwrap();
-        assert_eq!(j, r#"{"id":"dl-3","state":"downloading","note":"Resuming partial download"}"#);
+        let j = serde_json::to_string(&WireState {
+            id: "dl-3".into(),
+            inner: d,
+        })
+        .unwrap();
+        assert_eq!(
+            j,
+            r#"{"id":"dl-3","state":"downloading","note":"Resuming partial download"}"#
+        );
         let mut f = state_like("downloading");
         f.note = Some("server refused range requests - using a single connection".into());
-        let j = serde_json::to_string(&WireState { id: "dl-4".into(), inner: f }).unwrap();
+        let j = serde_json::to_string(&WireState {
+            id: "dl-4".into(),
+            inner: f,
+        })
+        .unwrap();
         assert_eq!(
             j,
             r#"{"id":"dl-4","state":"downloading","note":"server refused range requests - using a single connection"}"#
@@ -350,7 +424,13 @@ mod tests {
                 active: true,
                 phase: "receiving".into(),
             },
-            ConnInfo { index: 1, done: 0, size: None, active: false, phase: "idle".into() },
+            ConnInfo {
+                index: 1,
+                done: 0,
+                size: None,
+                active: false,
+                phase: "idle".into(),
+            },
         ];
         let p = ProgressPayload {
             bytes_done: 1234567,
@@ -359,7 +439,11 @@ mod tests {
             eta_secs: Some(245),
             conns,
         };
-        let json = serde_json::to_string(&WireProgress { id: "dl-1".into(), inner: p }).unwrap();
+        let json = serde_json::to_string(&WireProgress {
+            id: "dl-1".into(),
+            inner: p,
+        })
+        .unwrap();
         assert_eq!(
             json,
             r#"{"id":"dl-1","bytesDone":1234567,"total":7772412965,"speedBps":27000000,"etaSecs":245,"conns":[{"index":0,"done":1234567,"size":1943103242,"active":true,"phase":"receiving"},{"index":1,"done":0,"size":null,"active":false,"phase":"idle"}]}"#
@@ -372,8 +456,15 @@ mod tests {
             eta_secs: None,
             conns: vec![],
         };
-        let j = serde_json::to_string(&WireProgress { id: "dl-9".into(), inner: p }).unwrap();
-        assert_eq!(j, r#"{"id":"dl-9","bytesDone":5,"total":null,"speedBps":0,"etaSecs":null,"conns":[]}"#);
+        let j = serde_json::to_string(&WireProgress {
+            id: "dl-9".into(),
+            inner: p,
+        })
+        .unwrap();
+        assert_eq!(
+            j,
+            r#"{"id":"dl-9","bytesDone":5,"total":null,"speedBps":0,"etaSecs":null,"conns":[]}"#
+        );
     }
 
     #[test]
@@ -382,35 +473,14 @@ mod tests {
             serde_json::to_string(&StartAck { id: "dl-1".into() }).unwrap(),
             r#"{"id":"dl-1"}"#
         );
-        let m = MetaCheck { exists: true, compatible: true, bytes_done: 42 };
+        let m = MetaCheck {
+            exists: true,
+            compatible: true,
+            bytes_done: 42,
+        };
         assert_eq!(
             serde_json::to_string(&m).unwrap(),
             r#"{"exists":true,"compatible":true,"bytesDone":42}"#
         );
-    }
-}
-
-fn check_writable(dir: &std::path::Path) -> Result<(), String> {
-    match std::fs::metadata(dir) {
-        Err(_) => return Err(format!("destination is not writable: {}", dir.display())),
-        Ok(md) => {
-            if !md.is_dir() {
-                return Err(format!("destination is not writable: {}", dir.display()));
-            }
-        }
-    }
-    let probe = dir.join(".hydra-write-probe");
-    match std::fs::File::create(&probe) {
-        Err(e) => {
-            use std::io::ErrorKind;
-            match e.kind() {
-                ErrorKind::StorageFull => Err("disk full".to_string()),
-                _ => Err(format!("destination is not writable: {}", dir.display())),
-            }
-        }
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            Ok(())
-        }
     }
 }

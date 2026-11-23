@@ -176,12 +176,19 @@ pub fn filename_from_url(url: &str) -> Option<String> {
     }
 }
 
-/// Remove path separators and control characters, trim; reject ".", ".." and
-/// empty by substituting "download".
+/// Bidirectional formatting controls let a name lie about itself: U+202E makes
+/// "invoice\u{202e}fdp.exe" read as "invoiceexe.pdf". They carry no legitimate
+/// part in a filename, so sanitizing removes the whole set.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c as u32, 0x202A..=0x202E | 0x2066..=0x2069)
+}
+
+/// Remove path separators, control characters and bidi overrides, trim; reject
+/// ".", ".." and empty by substituting "download".
 pub fn sanitize_filename(raw: &str) -> String {
     let filtered: String = raw
         .chars()
-        .filter(|&c| c != '/' && c != '\\' && !c.is_ascii_control())
+        .filter(|&c| c != '/' && c != '\\' && !c.is_ascii_control() && !is_bidi_control(c))
         .collect();
     let trimmed = filtered.trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
@@ -196,6 +203,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sanitize_strips_bidi_overrides() {
+        // U+202E RIGHT-TO-LEFT OVERRIDE, U+2066 LEFT-TO-RIGHT ISOLATE
+        assert_eq!(
+            sanitize_filename("invoice\u{202e}fdp.exe"),
+            "invoicefdp.exe"
+        );
+        assert_eq!(sanitize_filename("a\u{2066}b\u{2069}c"), "abc");
+        // separators and controls still go, as before
+        assert_eq!(sanitize_filename("../etc/pass\u{0}wd"), "..etcpasswd");
+        assert_eq!(sanitize_filename("\u{202e}"), "download");
+    }
+
+    #[test]
     fn resolve_prefers_rfc5987_filename_star() {
         let cd = "attachment; filename=\"fallback.mkv\"; filename*=UTF-8''Reference%20File.mkv";
         assert_eq!(
@@ -207,7 +227,10 @@ mod tests {
     #[test]
     fn rfc5987_percent_decodes_utf8() {
         let cd = "attachment; filename*=UTF-8''%E2%82%AC%20rate.bin";
-        assert_eq!(filename_from_content_disposition(cd).unwrap(), "\u{20ac} rate.bin");
+        assert_eq!(
+            filename_from_content_disposition(cd).unwrap(),
+            "\u{20ac} rate.bin"
+        );
     }
 
     #[test]
@@ -220,7 +243,10 @@ mod tests {
     fn quoted_filename_with_escaped_quote() {
         // Raw header: filename="a\"b.tar.gz"  (backslash-escaped quote inside quotes.)
         let cd = "attachment; filename=\"a\\\"b.tar.gz\"";
-        assert_eq!(filename_from_content_disposition(cd).unwrap(), "a\"b.tar.gz");
+        assert_eq!(
+            filename_from_content_disposition(cd).unwrap(),
+            "a\"b.tar.gz"
+        );
     }
 
     #[test]
@@ -239,7 +265,10 @@ mod tests {
     #[test]
     fn unquoted_token_filename() {
         let cd = "attachment; filename=plain-name.zip";
-        assert_eq!(filename_from_content_disposition(cd).unwrap(), "plain-name.zip");
+        assert_eq!(
+            filename_from_content_disposition(cd).unwrap(),
+            "plain-name.zip"
+        );
     }
 
     #[test]
@@ -255,7 +284,10 @@ mod tests {
             "Reference File.mkv"
         );
         assert_eq!(filename_from_url("https://h/d/x.bin").unwrap(), "x.bin");
-        assert_eq!(filename_from_url("https://host/dl/file.mkv").unwrap(), "file.mkv");
+        assert_eq!(
+            filename_from_url("https://host/dl/file.mkv").unwrap(),
+            "file.mkv"
+        );
         assert_eq!(filename_from_url("https://h/"), None);
         assert_eq!(filename_from_url("https://h/d/"), None);
         assert_eq!(filename_from_url("https://host"), None);
@@ -288,6 +320,9 @@ mod tests {
             "file 1.mkv"
         );
         assert_eq!(resolve_filename(None, "https://host/"), "download");
-        assert_eq!(resolve_filename(Some("attachment"), "https://host/"), "download");
+        assert_eq!(
+            resolve_filename(Some("attachment"), "https://host/"),
+            "download"
+        );
     }
 }
