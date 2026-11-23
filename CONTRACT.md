@@ -84,8 +84,18 @@ Stops all workers, flushes meta, emits state "paused". Keeps .part + meta + in-m
 Emits state "downloading".
 
 ### cancel_download - args { id } -> null
-Stops workers, DELETES <filename>.part and <filename>.hydra.json, forgets the download.
-No state event afterwards.
+Stops workers, DELETES <filename>.part, <filename>.hydra.json and any
+<filename>.hydra.json.tmp, then forgets the download. No state event afterwards.
+
+The command resolves only AFTER the files are gone: the engine signals a oneshot
+ack that the bridge awaits (10 s upper bound). The reply therefore means "the
+partial download no longer exists", which the UI relies on - it re-checks for a
+resumable partial immediately after cancelling, and a following run on the same
+filename must not be able to race the cleanup sweep.
+
+Cancelling is the explicit "throw it away" action. A failed run does NOT delete
+anything: the .part and sidecar are deliberately kept so "Try again" and a later
+resume can continue from the bytes already paid for.
 
 ### pick_folder - args {} -> absolute folder path string | null
 Native folder picker (opens at the remembered folder when set).
@@ -145,6 +155,11 @@ k=2,3,...) -> delete meta -> emit state "done" with path + size.
 "destination is not writable: <path>"
 "the destination folder disappeared"
 "could not write to disk"
+"could not save settings"
+"could not reveal that file"
+"could not save the resume sidecar"
+"too many downloads in progress"
+"that file is already downloading"
 "server returned an unexpected Content-Range"
 "downloaded size mismatch: expected <n>, got <m>"
 "empty response from server"
@@ -159,6 +174,7 @@ ETA "4m 12s" / "1h 03m".
 ## Headless speedtest harness (engine implements; testlab scripts consume)
 
     src-tauri/target/release/examples/speedtest <url> [conns=4] [max_bytes=1073741824] [out=/tmp/hydra-speed.part] [run_seconds=0] [cancel_after_secs=0]
+    src-tauri/target/release/examples/speedtest --probe <url>
 
 - Probes, then downloads the FIRST max_bytes bytes of <url> using the same engine core as the
   app, with conns static chunks over [0, max_bytes).
@@ -169,6 +185,12 @@ ETA "4m 12s" / "1h 03m".
   app - stop the workers, then delete <out> and <out minus .part>.hydra.json (plus any
   .hydra.json.tmp left by an in-flight save). Prints "CANCELLED bytes=<n>" and a SUMMARY with
   cancelled=1, exit 0. Nothing may be left behind on disk.
+- "speedtest --probe <url>" probes only and prints
+  "PROBE acceptsRanges=<bool> size=<n|null> method=<head|range> server=<s|null>", exit 0 on a
+  successful probe. It reads headers only and pulls no body, so acceptance can pin the probe's
+  decisions (active range verification, unknown size) without downloading.
+- When the probe reports an unknown size, the harness runs the unknown-size path: one sequential
+  stream from 0, no sidecar, no resume.
 - Prints one "TICK t=<s> done=<bytes> speed_mibps=<x.x>" line per second.
 - Final machine-readable line: "SUMMARY ok=1 bytes=<n> elapsed_s=<x.x> avg_mibps=<y.y>
   resumed=<0|1> single=<0|1>" or "SUMMARY ok=0 error=<message>"; exit code 0 iff ok=1.
