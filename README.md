@@ -22,7 +22,7 @@ Acceptance run (real CDN, reference file 7.77 GB, this checkout, scripts/accepta
 | server ignores Range (200 fallback) | single-stream, byte-identical |
 | HEAD 405 -> ranged-GET probe fallback | ok, multi-connection |
 | flaky server (20% mid-body drops) | completes via retries, byte-identical |
-| cancel at 2 MiB | `.part`, sidecar and sidecar temp all deleted |
+| cancel mid-transfer (4 x 192 KiB/s for 3 s -> 2.0 MiB written) | `.part`, sidecar and sidecar temp all deleted |
 | server over-sends each 206 by 64 KiB | byte-identical (per-chunk cap holds) |
 | server goes silent mid-body | read deadline fires at 30 s, retry converges |
 | HEAD 200 without Accept-Ranges | verification GET upgrades to 4 connections |

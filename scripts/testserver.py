@@ -35,8 +35,9 @@ headless speedtest harness can exercise the downloader's HTTP behaviours:
                  retries always converge. Ranges of length 1 (probe
                  "bytes=0-0") are never dropped.
 
-Every response carries Content-Type: application/octet-stream, a true
-Content-Length, and Connection: close. The server is quiet (no per-request
+Every response carries Content-Type: application/octet-stream and
+Connection: close, and a true Content-Length - except in nolength mode, where
+the body is deliberately close-delimited so no length can be learned. The server is quiet (no per-request
 logging), robust against client aborts, and handles 16+ concurrent
 connections. The file is served at "/" regardless of its on-disk name.
 

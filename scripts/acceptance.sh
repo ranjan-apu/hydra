@@ -7,20 +7,26 @@
 #   scripts/acceptance.sh <REF_URL>  # run against a different reference target
 #
 # Stages (each prints PASS/FAIL; final summary table + ACCEPTANCE: PASS|FAIL):
-#   0 build         - cargo build --release --example speedtest
-#   1 throughput    - 4-conn avg_mibps >= 25.0 (+ single-conn, informational)
-#   2 resume        - 512 MiB fresh vs paused(6s)-then-resumed, shasum equality
-#   3 norange       - server ignores Range -> single-stream fallback (single=1)
-#   4 head-reject   - HEAD 405 + 206 ranged GETs -> multi-conn ranged download
-#   5 flaky         - mid-body drops at p=0.2 -> retries must converge
-#   6 unit          - cargo test
+#   0  build           - cargo build --release --example speedtest
+#   1  throughput      - 4-conn avg_mibps >= 25.0 (+ single-conn, informational)
+#   2  resume          - 512 MiB fresh vs paused(6s)-then-resumed, shasum equality
+#   3  norange         - server ignores Range -> single-stream fallback (single=1)
+#   4  head-reject     - HEAD 405 + 206 ranged GETs -> multi-conn ranged download
+#   5  flaky           - mid-body drops at p=0.2 -> retries must converge
+#   6  cancel-cleanup  - throttled run cancels itself -> .part/sidecar/tmp deleted
+#   7  oversend-bytecap- a 206 longer than its Content-Range must not corrupt
+#   8  stall-timeout   - silence is retried at the 30 s deadline (two-sided bound)
+#   9  probe-verify    - HEAD 200 without Accept-Ranges is upgraded by a GET
+#   10 unknown-size    - no Content-Length -> one stream, no sidecar
+#   11 unit            - cargo test
 #
 # Needs: cargo, python3, shasum, awk (base macOS tools; no GNU timeout needed).
-# All temp state lives under /tmp/hydra-acc/ and is removed by the cleanup
-# trap, which also kills every testserver this script started. Every speedtest
-# run is wrapped in a watchdog so the harness can never hang. Exit status is
-# 0 iff the final line is ACCEPTANCE: PASS. If stage 0 fails, the run stops
-# early (nothing else can execute) but still prints the summary table.
+# Temp state lives in a mktemp -d directory created by this script and removed by
+# the cleanup trap, which also kills every testserver it started; set
+# HYDRA_ACC_DIR to keep the artefacts (that directory is then NOT removed). Every
+# speedtest run is wrapped in a watchdog so the harness can never hang. Exit
+# status is 0 iff the final line is ACCEPTANCE: PASS. If stage 0 fails the run
+# stops early (nothing else can execute) but still prints the summary table.
 # =============================================================================
 set -euo pipefail
 
@@ -37,7 +43,15 @@ DEFAULT_REF_URL="${HYDRA_REF_URL:-}"  # no reference target committed; export HY
 # A fresh directory every run: a stale one from a killed run would otherwise
 # let the throughput stage 'download' a leftover partial, and a squatted
 # symlink at a predictable path is a clobber risk. mktemp -d is 0700.
-ACC_DIR="${HYDRA_ACC_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/hydra-acc.XXXXXX")}"
+# HYDRA_ACC_DIR keeps the artefacts instead - and is then NOT deleted on exit.
+ACC_DIR_OWNED=1
+if [ -n "${HYDRA_ACC_DIR:-}" ]; then
+  ACC_DIR="$HYDRA_ACC_DIR"
+  ACC_DIR_OWNED=0
+  mkdir -p "$ACC_DIR"
+else
+  ACC_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hydra-acc.XXXXXX")"
+fi
 RUN_LOG="$ACC_DIR/last-run.log"
 TESTFILE="$ACC_DIR/test64.bin"
 SRC_SHA=""
@@ -97,7 +111,11 @@ kill_servers() {
 
 cleanup() {
   kill_servers
-  rm -rf "$ACC_DIR"
+  # Only remove a directory this script created: an explicit HYDRA_ACC_DIR may
+  # be a real directory the caller wanted to keep.
+  if [ "${ACC_DIR_OWNED:-1}" = "1" ]; then
+    rm -rf "$ACC_DIR"
+  fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
