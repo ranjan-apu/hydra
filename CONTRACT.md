@@ -89,9 +89,10 @@ Stops workers, DELETES <filename>.part, <filename>.hydra.json and any
 
 The command resolves only AFTER the files are gone: the engine signals a oneshot
 ack that the bridge awaits (10 s upper bound). The reply therefore means "the
-partial download no longer exists", which the UI relies on - it re-checks for a
-resumable partial immediately after cancelling, and a following run on the same
-filename must not be able to race the cleanup sweep.
+partial download no longer exists", which the UI relies on - it removes the row
+when the reply lands (and, being session-only, keeps no state that could describe
+a file that no longer exists). A following run on the same filename must not be
+able to race the cleanup sweep.
 
 Cancelling is the explicit "throw it away" action. A failed run does NOT delete
 anything: the .part and sidecar are deliberately kept so "Try again" and a later
@@ -166,10 +167,23 @@ k=2,3,...) -> delete meta -> emit state "done" with path + size.
 
 ## Frontend state machine
 
-idle -> probing -> ready -> downloading -> paused -> done | error
-(error -> ready via "Try again" with the same parameters). The UI never computes speed or ETA
-(backend supplies both); it formats: IEC bytes (GiB/MiB), speed MiB/s with 1 decimal,
-ETA "4m 12s" / "1h 03m".
+Two independent machines, because the frontend is now a download manager rather than a single
+transfer view.
+
+1. **The compose form** (not a download, never becomes a list row):
+   idle -> probing -> ready. It can be used while any number of runs are transferring.
+2. **Each run**, keyed by the `id` the engine returns from start_download:
+   downloading -> paused -> done | error (error -> a new run via "Try again" with the same
+   parameters; the engine resumes the same `.part` from its sidecar).
+
+The UI keeps a session-only list of runs (no persistence: a restart starts with an empty list,
+because the engine owns on-disk state, not the UI). Events are matched by id; an event for an id
+the list does not know is ignored, and an event for an id the user has retired (cancelled) is
+dropped. The UI never computes speed or ETA (backend supplies both); it formats: IEC bytes
+(GiB/MiB), speed MiB/s with 1 decimal, ETA "4m 12s" / "1h 03m".
+
+Concurrency cap: MAX_CONCURRENT_DOWNLOADS (8) is enforced by the bridge; the UI mirrors it so
+"New download" reports the limit instead of letting a start fail, but the bridge is authoritative.
 
 ## Headless speedtest harness (engine implements; testlab scripts consume)
 

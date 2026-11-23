@@ -45,6 +45,11 @@ Acceptance run (real CDN, reference file 7.77 GB, this checkout, scripts/accepta
 6. Parallel ranged download; chunk = ceil(size / N), last chunk clamped to size-1
 7. Live progress: rolling ~2 s speed, bytes done/total, ETA, per-connection fill bars
    (events at >= 4 Hz)
+7a. Several downloads at once: a left rail lists every run (live and finished) with its own
+   progress and state, "New download" returns to the setup form without disturbing anything
+   already transferring, and selecting a row shows that run's detail. Up to 8 concurrent runs;
+   each has its own cancel/pause/resume. A finished row can be forgotten; a live one is
+   cancelled and its partial data deleted.
 8. Pause / Resume / Cancel - pause keeps .part + meta so Resume can continue; Cancel
    deletes the half-downloaded .part, its .hydra.json sidecar and any leftover .tmp, so a
    cancelled download leaves nothing behind
@@ -108,10 +113,12 @@ The frontend runs in a plain browser against a mock that implements the exact
 Tauri contract:
 
     python3 -m http.server 8801
-    open "http://127.0.0.1:8801/ui/index.html?demo=downloading"
+    open "http://127.0.0.1:8801/ui/index.html?demo=multi"
 
-Demo states: idle | probing | ready | resume | downloading | paused | done |
-error | single. Add &snap=1 to resolve instantly for a deterministic screenshot.
+Demo states: compose | ready | done | error | multi. `multi` drives the real UI
+path - it types a URL, probes, starts five runs and then moves them into paused,
+complete and failed - so the rail and every detail state render from the shipping
+code. Add &snap=1 to resolve instantly for a deterministic screenshot.
 Inside real Tauri the mock stands aside automatically (it installs
 window.__TAURI__ only when the runtime has not already provided it).
 

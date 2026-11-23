@@ -16,6 +16,19 @@ bottom, so the multi-stream advantage is legible at a glance instead of implied 
 Surface mode: **Operate**. The user is mid-task; familiarity and precision outrank expression,
 and the brand lives in exact details (the comb, the three-stream mark, the probe readout).
 
+## The shell
+
+The window is a **rail and a stage**. A 248px rail lists every download the app knows
+about - name, percentage, a 3px progress line, state - and the stage shows either the
+compose form or the selected run. The rail exists because concurrency is the product: with
+eight streams the user needs all of them in view, and a single progress view cannot say
+"three of five are done".
+
+The stage is one surface with two occupants that never appear together. The compose form
+holds it until a run is selected or started; the detail view holds it until the user asks
+for a new download. The action bar belongs to the stage rather than to the app, so its
+buttons and its hint always describe what is actually in front of you.
+
 ## Tokens
 
 Colour is restrained by strategy: neutrals tinted toward the ground, one accent, and three
@@ -73,23 +86,39 @@ moment - the three-stream mark breathes only while bytes are moving.
   (HEAD / Range GET), Server. Uppercase micro keys, mono values.
 - **Resume note** - the only `--info` blue in the app: "Partial file found - 8.09 GiB of
   32.16 GiB done."
-- **Comb** - one cell per connection: index, 32px track filling from the bottom, percentage.
-  Phase colours: mint (receiving/done), dim (idle/connecting), amber + amber border (retrying).
-  Above it, a summary line ("3/8 complete"). A single-stream run shows the sentence
-  "single stream" instead of one stretched bar.
+- **Rail** - "New download" plate, a count of active runs, the list, and a teaching empty
+  state directly under the button. The list scrolls on its own; the button does not move.
+- **List row** - filename (mono, ellipsised, full name in `title`), integer percentage, 3px
+  progress line, state word. Selection is a mint-tinted plate with a hairline border - never a
+  stripe down one side. Hover (or keyboard focus) reveals a 22px cancel/forget control; it stays
+  invisible otherwise, because eight visible delete buttons would make the rail read as a
+  destructive control panel.
+- **Comb** - one cell per connection: index, a 12px-wide tooth filling from the bottom,
+  percentage. Twelve pixels rather than a full-width block is deliberate: at eight connections a
+  wide block chart is mostly ink and stops reading as data. Phase colours: mint (receiving/done),
+  dim (idle/connecting), amber + amber border (retrying). Above it, a summary line
+  ("3/8 complete"). A single-stream run shows the sentence "single stream" instead of one
+  stretched bar.
 - **Buttons** - primary (mint gradient, offset plate), secondary (hairline on translucent
   white), ghost (transparent, red on hover for destructive). Every one has default / hover /
   active / disabled / focus-visible.
-- **Done panel** - check, "Download complete - <size>", final path, Reveal in Finder; the full
-  bar and the full comb stay on screen above it as the evidence of the run.
+- **Done panel** - check, "Download complete - <size>", final path; the full bar stays above it
+  as the evidence of the run. Reveal in Finder lives in the action bar, so the panel itself
+  carries no button.
 
 ## States
 
-`idle -> probing -> ready -> downloading -> paused -> done | error`, plus the single-stream
-variant. While a run owns the window (`downloading / paused / error / done`) the setup cards
-step aside so the transfer and its controls are the only thing in view; the footer hint reports
-what the engine is actually doing, not what was requested. A failure keeps the last measured
-frame on screen - percentage, bytes, per-connection bars - because where it died is information.
+Two machines, deliberately independent.
+
+- **The compose form**: `idle -> probing -> ready`. It is not a download and never becomes a
+  row, so the rail can never hold something without an id.
+- **Each run**: `downloading -> paused -> done | error`. Runs are independent: starting a
+  second one does not disturb the first, and the compose form is usable while eight are running.
+
+The header pill reports the aggregate ("3 downloading", "Paused", "Complete"), the rail reports
+per-run state, and the action-bar hint reports what the engine is actually doing, not what was
+requested. A failure keeps the last measured frame on screen - percentage, bytes, per-connection
+teeth - because where it died is information.
 
 ## Accessibility
 
@@ -99,6 +128,9 @@ frame on screen - percentage, bytes, per-connection bars - because where it died
 - `:focus-visible` is a 2px accent outline with 2px offset on every control.
 - The connections value is an `<output for="conn-range">` with `aria-valuetext` on the slider.
 - The comb is decorative to assistive tech (`aria-hidden`); the summary line carries the fact.
+- Rail rows are real `<button>`s carrying `aria-current` for the selection and an
+  `aria-label` of "name, state" (plus the consequence for the cancel/forget control), so the
+  list is keyboard-operable without custom listbox semantics.
 - Text selection is tinted mint; carets take the accent; scrollbars are themed to the ground.
 - `prefers-reduced-motion` collapses every animation and transition.
 
@@ -111,9 +143,15 @@ frame on screen - percentage, bytes, per-connection bars - because where it died
    re-created per progress event.
 4. **The Mono Rule** - if it is a number, a name, or a path, it is monospace and tabular.
 5. **The Evidence Rule** - a finished or failed run leaves its numbers and bars on screen.
+6. **The Stage Rule** - one occupant at a time. The stage shows the compose form or exactly one
+   run; selection is the router, and nothing else switches it. Esc always returns to compose.
+7. **The Session Rule** - the rail is session state: nothing is persisted, so a restart starts
+   empty. A row's control cancels-and-deletes for a live run and only forgets a finished one;
+   both are named in its `aria-label`.
 
 ## Responsive
 
-The window is resizable (880x700 default, 720x600 minimum). At <=720px the meta grid drops to
-two columns, the comb to four, the action hint retires, and the content gutter tightens; at
-<=520px the stat row drops to two columns and the engine badge retires.
+The window is resizable (1080x720 default, 900x620 minimum - the rail costs 248px, so the
+minimum rose with it). At <=900px the rail narrows to 210px; in a browser below the app's own
+minimum the meta grid drops to two columns, the comb to four, the action hint retires and the
+stat row to two columns.
