@@ -55,12 +55,21 @@ pub fn save(path: &Path, s: &Settings) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    {
+    let write = || -> std::io::Result<()> {
         let mut f = File::create(&tmp)?;
         f.write_all(json.as_bytes())?;
-        f.write_all(b"\n")?;
+        f.write_all(b"\n")
+    };
+    if let Err(e) = write() {
+        // Never leave a half-written temp behind on a failed save.
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::rename(&tmp, path)
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Partial update for the save_settings command:

@@ -36,13 +36,23 @@ pub fn save_atomic(path: &Path, meta: &MetaFile) -> std::io::Result<()> {
     let json = serde_json::to_string(meta)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = tmp_path(path);
-    {
+    let write = || -> std::io::Result<()> {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(json.as_bytes())?;
         f.write_all(b"\n")?;
-        f.sync_all()?;
+        f.sync_all()
+    };
+    if let Err(e) = write() {
+        // A half-written temp is never useful. Removing it keeps a failed save
+        // from leaving the one artefact nothing else would ever clean up.
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::rename(&tmp, path)
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Same-directory temp path for the atomic save.
