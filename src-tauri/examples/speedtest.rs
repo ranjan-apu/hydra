@@ -36,6 +36,34 @@ async fn real_main() -> i32 {
         println!("SUMMARY ok=0 error=missing url");
         return 1;
     }
+    // "--probe <url>": report what the probe decided and exit, without pulling a
+    // single byte of body. Acceptance pins the range-verification and
+    // unknown-size behaviours through this.
+    if args[0] == "--probe" {
+        let Some(target) = args.get(1) else {
+            println!("SUMMARY ok=0 error=missing url");
+            return 1;
+        };
+        let client = http_client();
+        return match probe::probe(target, &client).await {
+            Ok(i) => {
+                println!(
+                    "PROBE acceptsRanges={} size={} method={} server={}",
+                    i.accepts_ranges,
+                    i.size
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".into()),
+                    i.probe_method,
+                    i.server.unwrap_or_else(|| "null".into())
+                );
+                0
+            }
+            Err(e) => {
+                println!("SUMMARY ok=0 error={}", e);
+                1
+            }
+        };
+    }
     let url = args[0].clone();
     let conns: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(4);
     let max_bytes: u64 = args
@@ -59,15 +87,10 @@ async fn real_main() -> i32 {
             return 1;
         }
     };
-    let full_size = match info.size {
-        Some(s) => s,
-        None => {
-            println!("SUMMARY ok=0 error=probe returned unknown size");
-            return 1;
-        }
-    };
-    // Download the FIRST max_bytes bytes (or the whole file when smaller).
-    let eff = full_size.min(max_bytes);
+    // Unknown total (CONTRACT size = null): single sequential stream from 0, no
+    // sidecar and no resume - the engine stops when the server closes. Otherwise
+    // download the FIRST max_bytes bytes (or the whole file when smaller).
+    let eff = info.size.map(|s| s.min(max_bytes));
 
     let base = out.strip_suffix(".part").unwrap_or(&out).to_string();
     let part_path = PathBuf::from(&out);
@@ -80,7 +103,8 @@ async fn real_main() -> i32 {
     let single_meta = !info.accepts_ranges;
     if part_path.exists() {
         if let Some(m) = meta::load(&meta_path) {
-            if meta::is_compatible(&m, &info.url, eff) && !(single_meta && m.chunks.len() > 1) {
+            let compatible = eff.is_some_and(|e| meta::is_compatible(&m, &info.url, e));
+            if compatible && !(single_meta && m.chunks.len() > 1) {
                 let part_len = std::fs::metadata(&part_path).map(|s| s.len()).unwrap_or(0);
                 let mut m = m;
                 meta::clamp_dones(&mut m, part_len);
@@ -105,13 +129,16 @@ async fn real_main() -> i32 {
         connections: conns,
         // Virtual size = the first max_bytes bytes; the Content-Range
         // cross-check still validates against the real probed total.
-        size: Some(eff),
-        probed_total: Some(full_size),
+        size: eff,
+        probed_total: info.size,
         accepts_ranges: info.accepts_ranges,
     };
     // Honest wall-clock average of the transfer: probe excluded.
     let transfer_start = Instant::now();
-    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
+    // Same bounded queue the app uses, so the harness exercises the real
+    // delivery policy rather than an unbounded stand-in.
+    let (evt_tx, mut evt_rx) =
+        tokio::sync::mpsc::channel::<EngineEvent>(hydra_lib::engine::download::EVENT_QUEUE_CAP);
     let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel::<Ctrl>();
     tokio::spawn(run(spec, evt_tx, ctrl_rx));
 
@@ -217,7 +244,7 @@ async fn real_main() -> i32 {
             _ = &mut cancel_sleep, if cancel_armed => {
                 cancel_armed = false;
                 cancelled = true;
-                let _ = ctrl_tx.send(Ctrl::Cancel);
+                let _ = ctrl_tx.send(Ctrl::Cancel(None));
             },
         }
     }
