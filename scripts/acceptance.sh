@@ -42,6 +42,9 @@ SRC_SHA=""
 PORT_NORANGE=""
 PORT_RANGE=""
 PORT_FLAKY=""
+PORT_CANCEL=""
+PORT_OVERSEND=""
+PORT_STALL=""
 SERVER_PIDS=""                 # space-separated pids of testserver instances
 
 STAGE_NAMES=()
@@ -201,14 +204,14 @@ wait_port() {  # wait_port <port>: up to ~15 s for the server to accept
   return 1
 }
 
-start_server() {  # start_server <mode> <port> <file> [drop_p]
-  local mode="$1" port="$2" file="$3" drop=""
+start_server() {  # start_server <mode> <port> <file> [drop_p] [rate_kib]
+  local mode="$1" port="$2" file="$3" drop="" rate="" extra=""
   if [ $# -ge 4 ]; then drop="$4"; fi
-  if [ -n "$drop" ]; then
-    python3 "$TESTSERVER" --mode "$mode" --port "$port" --file "$file" --drop-p "$drop" &
-  else
-    python3 "$TESTSERVER" --mode "$mode" --port "$port" --file "$file" &
-  fi
+  if [ $# -ge 5 ]; then rate="$5"; fi
+  if [ -n "$drop" ]; then extra="$extra --drop-p $drop"; fi
+  if [ -n "$rate" ]; then extra="$extra --rate-kib $rate"; fi
+  # shellcheck disable=SC2086  # $extra is a deliberate argument list
+  python3 "$TESTSERVER" --mode "$mode" --port "$port" --file "$file" $extra &
   SERVER_PIDS="$SERVER_PIDS $!"
   wait_port "$port"
 }
@@ -540,6 +543,134 @@ stage_flaky() {
   return "$rc"
 }
 
+cancel_checks() {
+  local url="$1"
+  local dir="$ACC_DIR/cancel"
+  local out="$dir/cancel.bin.part"
+  local meta="$dir/cancel.bin.hydra.json"
+  local tmpp="$meta.tmp"
+  local midway="" bytes="" rc=0 waited=0 pid
+
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  # Throttled run that cancels itself after 3 s, in the background so we can
+  # first prove the partials really exist on disk.
+  "$SPEEDTEST" "$url" 4 67108864 "$out" 0 3 >"$ACC_DIR/cancel.log" 2>&1 &
+  pid=$!
+  while [ "$waited" -lt 40 ]; do
+    if [ -s "$out" ] && [ -s "$meta" ]; then midway="yes"; break; fi
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+  wait "$pid" || rc=$?
+  cat "$ACC_DIR/cancel.log" || true
+  if [ "$rc" != 0 ]; then note "speedtest exit $rc (want 0 after a clean cancel)"; return 1; fi
+  if [ -z "$midway" ]; then note "partials never appeared on disk - nothing was proven"; return 1; fi
+  grep -q "^CANCELLED" "$ACC_DIR/cancel.log" || { note "no CANCELLED line"; return 1; }
+  bytes="$(sed -n 's/^CANCELLED bytes=\([0-9]*\)$/\1/p' "$ACC_DIR/cancel.log" | tail -1)"
+  if [ -z "$bytes" ] || [ "$bytes" -le 0 ]; then
+    note "cancelled before any bytes landed (bytes=$bytes)"
+    return 1
+  fi
+  if [ -e "$out" ]; then note "half-downloaded .part survived the cancel"; return 1; fi
+  if [ -e "$meta" ]; then note "resume sidecar survived the cancel"; return 1; fi
+  if [ -e "$tmpp" ]; then note "sidecar temp survived the cancel"; return 1; fi
+  note "cancelled at ${bytes} B: .part + .hydra.json + .tmp all removed"
+  return 0
+}
+
+stage_cancel() {
+  local rc=1
+  if prep_testfile && start_server range "$PORT_CANCEL" "$TESTFILE" "" 192 && cancel_checks "http://127.0.0.1:$PORT_CANCEL/"; then
+    rc=0
+  fi
+  kill_servers
+  return "$rc"
+}
+
+oversend_checks() {
+  local url="$1"
+  local out="$ACC_DIR/oversend.part"
+  local ok single data sha rgres
+  # harness self-check: the 206 still declares an honest Content-Range while the
+  # body carries 64 KiB more than it promised
+  rgres="$(probe_check "$url" GET "bytes=0-1023")"
+  if [ "${rgres%% *}" != "206" ]; then
+    note "self-check ranged GET -> $rgres (want 206)"
+    return 1
+  fi
+  case "$rgres" in
+    *"content-range=bytes 0-1023/67108864"*) ;;
+    *) note "self-check Content-Range wrong: $rgres"; return 1 ;;
+  esac
+  if ! run_speed 180 "$url" 4 67108864 "$out" 0; then
+    note "speedtest run failed or timed out"
+    return 1
+  fi
+  ok="$(summary_get "$RUN_LOG" ok)"
+  if [ "$ok" != "1" ]; then
+    note "SUMMARY ok=$ok error=$(summary_error "$RUN_LOG")"
+    return 1
+  fi
+  single="$(summary_get "$RUN_LOG" single)"
+  data="$(data_file "$out")" || { note "no data file at $out"; return 1; }
+  sha="$(sha_of "$data")"
+  if [ "$sha" != "$SRC_SHA" ]; then
+    note "shasum mismatch - over-sent bytes spilled into the file: src=$SRC_SHA got=$sha"
+    return 1
+  fi
+  note "ok=1 single=$single sha=match port=$PORT_OVERSEND (+64KiB per 206)"
+  return 0
+}
+
+stage_oversend() {
+  local rc=1
+  if prep_testfile && start_server oversend "$PORT_OVERSEND" "$TESTFILE" && oversend_checks "http://127.0.0.1:$PORT_OVERSEND/"; then
+    rc=0
+  fi
+  kill_servers
+  return "$rc"
+}
+
+stall_checks() {
+  local url="$1"
+  local out="$ACC_DIR/stall.part"
+  local ok data sha started ended elapsed
+  started="$(date +%s)"
+  if ! run_speed 240 "$url" 4 67108864 "$out" 0; then
+    note "speedtest run failed or timed out - a missing idle timeout hangs forever"
+    return 1
+  fi
+  ended="$(date +%s)"
+  elapsed=$((ended - started))
+  ok="$(summary_get "$RUN_LOG" ok)"
+  if [ "$ok" != "1" ]; then
+    note "SUMMARY ok=$ok error=$(summary_error "$RUN_LOG")"
+    return 1
+  fi
+  data="$(data_file "$out")" || { note "no data file at $out"; return 1; }
+  sha="$(sha_of "$data")"
+  if [ "$sha" != "$SRC_SHA" ]; then
+    note "shasum mismatch: src=$SRC_SHA got=$sha"
+    return 1
+  fi
+  if [ "$elapsed" -lt 25 ]; then
+    note "finished in ${elapsed}s - the 30 s idle timeout never fired"
+    return 1
+  fi
+  note "ok=1 sha=match elapsed=${elapsed}s (idle timeout fired, retry converged)"
+  return 0
+}
+
+stage_stall() {
+  local rc=1
+  if prep_testfile && start_server stall "$PORT_STALL" "$TESTFILE" && stall_checks "http://127.0.0.1:$PORT_STALL/"; then
+    rc=0
+  fi
+  kill_servers
+  return "$rc"
+}
+
 stage_unit() {
   if ! (cd "$ROOT/src-tauri" && timeout_run 900 cargo test); then
     note "cargo test failed"
@@ -624,6 +755,9 @@ mkdir -p "$ACC_DIR"
 PORT_NORANGE="$(pick_port)"
 PORT_RANGE="$(pick_port)"
 PORT_FLAKY="$(pick_port)"
+PORT_CANCEL="$(pick_port)"
+PORT_OVERSEND="$(pick_port)"
+PORT_STALL="$(pick_port)"
 
 run_stage "0 build" stage_build
 if [ "${STAGE_RESULTS[0]}" = "FAIL" ]; then
@@ -637,7 +771,10 @@ run_stage "2 resume" stage_resume
 run_stage "3 norange-fallback" stage_norange
 run_stage "4 head-reject+ranges" stage_range
 run_stage "5 flaky-retry" stage_flaky
-run_stage "6 unit" stage_unit
+run_stage "6 cancel-cleanup" stage_cancel
+run_stage "7 oversend-bytecap" stage_oversend
+run_stage "8 stall-timeout" stage_stall
+run_stage "9 unit" stage_unit
 
 print_summary
 exit "$STAGE_FAIL"

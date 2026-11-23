@@ -11,6 +11,16 @@ headless speedtest harness can exercise the downloader's HTTP behaviours:
   --mode norange ALWAYS 200 with the full body (Range ignored) plus
                  Accept-Ranges: none; HEAD answers 200 with true headers,
                  forcing the client's single-stream fallback.
+  --mode oversend range mode, PLUS a 206 whose body is LONGER than the range
+                 it declared in Content-Range (Content-Length covers the
+                 excess, so the client really does receive it). Pins the
+                 downloader's per-chunk byte cap: a client without one writes
+                 past the chunk end and corrupts its neighbour.
+  --mode stall   range mode, PLUS the first request for any given range gets
+                 its headers plus --stall-prefix bytes and then silence (no
+                 FIN, no RST) for --stall-secs. The same range is served in
+                 full on a later request, so a client with a read timeout
+                 converges; one without hangs forever. Pins the stall timeout.
   --mode flaky   range mode, PLUS drops the connection mid-body with
                  probability --drop-p after sending a random 0-256 KiB
                  prefix. The server remembers the last dropped byte-range
@@ -33,17 +43,28 @@ import argparse
 import mmap
 import random
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CHUNK = 64 * 1024        # body streaming granularity
 MAX_PREFIX = 256 * 1024  # max bytes sent before a flaky drop
+OVERSEND_BYTES = 64 * 1024  # extra bytes appended to a 206 in oversend mode
+STALL_PREFIX = 4096         # bytes sent before going silent in stall mode
+# Bytes per second PER CONNECTION (0 = unlimited). Lets a test hold a transfer
+# open long enough to cancel or interrupt it with real partial data on disk.
+RATE_BYTES = 0
 
 # Filled in by main().
 MODE = "range"
 DATA = b""
 SIZE = 0
 DROP_P = 0.15
+STALL_SECS = 45
 RNG = random.Random()
+
+# Stall-mode memory: ranges that have already stalled once, so a retry of the
+# same range is served in full and the run can converge.
+STALLED = set()
 
 # Flaky-mode per-server memory: the most recently dropped (start, end).
 LAST_DROPPED = None
@@ -185,13 +206,32 @@ class QuietHandler(BaseHTTPRequestHandler):
     def _send_slice(self, status, start, end, extra):
         global LAST_DROPPED
         length = max(0, end - start + 1)
+        # oversend: declare the honest range, then ship extra bytes past its end
+        body_len = length + OVERSEND_BYTES if (MODE == "oversend" and status == 206) else length
         self.send_response(status)
-        self._common_headers(length)
+        self._common_headers(body_len)
         for key, value in extra:
             self.send_header(key, value)
         self.end_headers()
-        if self.command == "HEAD" or length == 0:
+        if self.command == "HEAD" or body_len == 0:
             return  # defensive: never a body for HEAD
+        if MODE == "stall":
+            with STATE_LOCK:
+                first_time = (start, end) not in STALLED
+                if first_time:
+                    STALLED.add((start, end))
+            if first_time:
+                # Headers are on the wire and Content-Length promises more: go
+                # silent without closing, the worst case for a reader that has
+                # no idle timeout.
+                try:
+                    if STALL_PREFIX:
+                        self.wfile.write(DATA[start:start + min(STALL_PREFIX, length)])
+                        self.wfile.flush()
+                    time.sleep(STALL_SECS)
+                except OSError:
+                    pass
+                return
         if MODE == "flaky":
             prefix = None
             with STATE_LOCK:
@@ -212,22 +252,39 @@ class QuietHandler(BaseHTTPRequestHandler):
                     pass
                 return  # connection dies here: short body vs Content-Length
         sent = 0
+        slice_start = time.time()
         try:
-            while sent < length:
-                piece = DATA[start + sent:start + sent + CHUNK]
+            while sent < body_len:
+                take = min(CHUNK, body_len - sent)
+                if sent + take <= length:
+                    piece = DATA[start + sent:start + sent + take]
+                elif sent < length:
+                    # final honest piece, then straight into the excess
+                    piece = DATA[start + sent:start + length]
+                    need = take - len(piece)
+                    piece = piece + DATA[end + 1:end + 1 + need]
+                else:
+                    off = end + 1 + (sent - length)
+                    piece = DATA[off:off + take]
                 if not piece:
                     break
                 self.wfile.write(piece)
                 sent += len(piece)
+                if RATE_BYTES > 0:
+                    # pace this connection so a test can catch it mid-transfer
+                    ahead = sent / RATE_BYTES - (time.time() - slice_start)
+                    if ahead > 0:
+                        time.sleep(min(ahead, 0.5))
         except OSError:
             pass  # client went away; nothing to do
 
 
 def main(argv=None):
-    global MODE, DATA, SIZE, DROP_P
+    global MODE, DATA, SIZE, DROP_P, STALL_SECS, RATE_BYTES
     parser = argparse.ArgumentParser(
         description="Hydra acceptance-test file server (see scripts/README-TESTS.md)")
-    parser.add_argument("--mode", choices=("range", "norange", "flaky"),
+    parser.add_argument("--mode",
+                        choices=("range", "norange", "flaky", "oversend", "stall"),
                         default="range", help="server behaviour (default: range)")
     parser.add_argument("--port", type=int, default=8899,
                         help="listen port (default: 8899)")
@@ -237,6 +294,10 @@ def main(argv=None):
                         help="flaky mode: drop probability per droppable request (default: 0.15)")
     parser.add_argument("--bind", default="127.0.0.1",
                         help="bind address (default: 127.0.0.1)")
+    parser.add_argument("--stall-secs", dest="stall_secs", type=float, default=45.0,
+                        help="stall mode: seconds of silence before closing (default: 45)")
+    parser.add_argument("--rate-kib", dest="rate_kib", type=float, default=0.0,
+                        help="throttle each connection to this many KiB/s (default: unlimited)")
     args = parser.parse_args(argv)
     if not 0.0 <= args.drop_p <= 1.0:
         parser.error("--drop-p must be within [0.0, 1.0]")
@@ -251,6 +312,8 @@ def main(argv=None):
             f.seek(0)
             DATA = f.read()
     MODE, SIZE, DROP_P = args.mode, len(DATA), args.drop_p
+    STALL_SECS = args.stall_secs
+    RATE_BYTES = int(args.rate_kib * 1024) if args.rate_kib > 0 else 0
     server = QuietServer((args.bind, args.port), QuietHandler)
     print("testserver mode=%s bind=%s port=%d file=%s size=%d drop_p=%s"
           % (MODE, args.bind, args.port, args.file, SIZE, DROP_P), flush=True)
