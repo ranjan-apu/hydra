@@ -879,13 +879,13 @@ struct MonitorCtx {
 }
 
 /// Aggregate worker counters and serialize the current chunk state.
-fn save_meta_snapshot(
-    path: &Path,
-    url: &str,
-    size: u64,
-    chunk_size: u64,
-    workers: &[Arc<WorkerShared>],
-) -> io::Result<()> {
+/// Freeze the current chunk counters into a sidecar payload.
+///
+/// Called BEFORE the .part fsync on purpose: the payload must describe exactly
+/// the bytes the fsync is about to make durable. Reading the counters afterwards
+/// would claim everything written during the fsync window, and a crash there
+/// leaves done-counts ahead of the data - a resume then skips the holes.
+fn meta_snapshot(url: &str, size: u64, chunk_size: u64, workers: &[Arc<WorkerShared>]) -> MetaFile {
     let chunks: Vec<MetaChunk> = workers
         .iter()
         .map(|w| MetaChunk {
@@ -894,13 +894,12 @@ fn save_meta_snapshot(
             done: w.done.load(Ordering::SeqCst),
         })
         .collect();
-    let m = MetaFile {
+    MetaFile {
         url: url.to_string(),
         size,
         chunk_size,
         chunks,
-    };
-    meta::save_atomic(path, &m)
+    }
 }
 
 /// Same atomically-saved snapshot, executed on a blocking thread (fix #5).
@@ -930,9 +929,12 @@ async fn save_meta_offline(
         if cancelling.load(Ordering::SeqCst) {
             return Ok(());
         }
-        // Durability order: a sidecar may only claim bytes that are themselves on
-        // the disk, or a crash leaves done-counts ahead of the data and a resume
-        // skips the missing holes. A failed fsync therefore FAILS the save.
+        // POST-ORDER (the fix that was missing): freeze the counters first, then
+        // make the data durable, then write the claim. The other order - fsync,
+        // then read the counters - claims every byte written during the fsync's
+        // own window, which a crash at that moment silently loses.
+        let snapshot = meta_snapshot(&url, size, chunk_size, &workers);
+        // A failed fsync FAILS the save: the sidecar may not outrun the data.
         if let Ok(f) = OpenOptions::new().write(true).open(&part_path) {
             f.sync_data()?;
         }
@@ -942,7 +944,7 @@ async fn save_meta_offline(
         if cancelling.load(Ordering::SeqCst) {
             return Ok(());
         }
-        save_meta_snapshot(&path, &url, size, chunk_size, &workers)
+        meta::save_atomic(&path, &snapshot)
     })
     .await
     {
@@ -1140,6 +1142,31 @@ async fn flush_meta(
     }
 }
 
+/// If a Cancel is queued, honour it now: mark the run cancelled, delete the
+/// partial and the sidecar (sweeping to a bounded depth), ack the caller and say
+/// so. Returns true when the run was cancelled and the caller must stop.
+///
+/// Called at every point of no return in `finalize`, because a cancel that lands
+/// while the completion path is syncing or verifying must still either win
+/// cleanly or be reported as too late - never be dropped on the floor.
+async fn honour_pending_cancel(
+    spec: &DownloadSpec,
+    ctrl_rx: &mut UnboundedReceiver<Ctrl>,
+    cancelling: &Arc<AtomicBool>,
+) -> bool {
+    while let Ok(pending) = ctrl_rx.try_recv() {
+        if let Ctrl::Cancel(ack) = pending {
+            cancelling.store(true, Ordering::SeqCst);
+            cleanup_cancel(spec).await;
+            if let Some(tx) = ack {
+                let _ = tx.send(());
+            }
+            return true;
+        }
+    }
+    false
+}
+
 /// Cancel_download cleanup: delete the partial bytes and the sidecar.
 /// No state event afterwards (CONTRACT).
 ///
@@ -1217,18 +1244,10 @@ async fn finalize(
     join_bounded(&mut active.handles, Duration::from_secs(1)).await;
 
     // A cancel queued while the workers were being joined wins here: nothing has
-    // been renamed yet, so "delete it" is still unambiguous. Without this the
-    // cancel is never acked and the caller waits out its budget while a finished
-    // file appears anyway.
-    while let Ok(pending) = ctrl_rx.try_recv() {
-        if let Ctrl::Cancel(ack) = pending {
-            active.cancelling.store(true, Ordering::SeqCst);
-            cleanup_cancel(spec).await;
-            if let Some(tx) = ack {
-                let _ = tx.send(());
-            }
-            return;
-        }
+    // been renamed yet, so "delete it" is still unambiguous.
+    let cancelling = Arc::clone(&active.cancelling);
+    if honour_pending_cancel(spec, ctrl_rx, &cancelling).await {
+        return;
     }
     let speed = run.speed_bps.load(Ordering::SeqCst);
     emit_progress(events, build_progress(run, plan.size, speed));
@@ -1282,6 +1301,13 @@ async fn finalize(
             return;
         }
     }
+    // Last chance: the sync and the byte verification above can take seconds on a
+    // multi-GiB file, and a cancel that arrives during them must still win while
+    // the bytes are a .part. After the rename below it is genuinely too late.
+    if honour_pending_cancel(spec, ctrl_rx, &cancelling).await {
+        return;
+    }
+
     let target = match unique_target(&spec.final_path) {
         Ok(t) => t,
         Err(e) => {

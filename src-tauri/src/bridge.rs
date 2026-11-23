@@ -237,9 +237,12 @@ pub async fn cancel_download(app: AppHandle, id: String) -> Result<(), String> {
         // Bounded wait: a wedged engine must not wedge the IPC call. No ack means
         // the engine was already past the point of no return (it had renamed the
         // file), so say that rather than claiming a clean cancel.
-        let acked = tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx)
-            .await
-            .is_ok();
+        // Only Ok(Ok(())) is an ack. Ok(Err(_)) means the engine dropped the
+        // sender without confirming, which is exactly as unconfirmed as a timeout.
+        let acked = matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await,
+            Ok(Ok(()))
+        );
         if !acked {
             registry.remove(&id);
             return Err("the download had already finished".to_string());

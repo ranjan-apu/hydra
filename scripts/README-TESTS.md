@@ -17,10 +17,11 @@ Stages 1-2 need internet access to the reference CDN; every other stage is
 localhost-only and never touches the network.
 
 Scratch state lives in a `mktemp -d` directory (0700, unpredictable) that the
-EXIT trap removes along with every `testserver.py` the script started. The
-directory is never reused, so a killed run cannot leave a partial that a later
-run would "resume" by accident, and a squatted symlink has nowhere to sit.
-`HYDRA_ACC_DIR` overrides it if you want to keep the artefacts.
+EXIT trap removes along with every `testserver.py` the script started. Because it is never
+reused, a killed run cannot leave a partial that a later run would "resume" by
+accident, and a squatted symlink has nowhere to sit.
+Set `HYDRA_ACC_DIR` to keep the artefacts instead: that directory is created if
+needed and deliberately NOT removed on exit.
 Exit code is 0 iff the final line is `ACCEPTANCE: PASS`. Every speedtest
 invocation is wrapped in a watchdog (`timeout_run`: a background sleep+kill,
 since macOS has no GNU `timeout`), so a hung run cannot hang the gate.

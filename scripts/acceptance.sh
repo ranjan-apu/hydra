@@ -14,7 +14,7 @@
 #   4  head-reject     - HEAD 405 + 206 ranged GETs -> multi-conn ranged download
 #   5  flaky           - mid-body drops at p=0.2 -> retries must converge
 #   6  cancel-cleanup  - throttled run cancels itself -> .part/sidecar/tmp deleted
-#   7  oversend-bytecap- a 206 longer than its Content-Range must not corrupt
+#   7  oversend-bytecap - a 206 longer than its Content-Range must not corrupt
 #   8  stall-timeout   - silence is retried at the 30 s deadline (two-sided bound)
 #   9  probe-verify    - HEAD 200 without Accept-Ranges is upgraded by a GET
 #   10 unknown-size    - no Content-Length -> one stream, no sidecar
@@ -575,14 +575,14 @@ stage_flaky() {
 
 cancel_checks() {
   local url="$1"
-  local dir="$ACC_DIR/cancel"
+  # A throwaway subdirectory of the scratch dir: never rm -rf a path that could
+  # be the caller's (HYDRA_ACC_DIR may point at a real directory).
+  local dir
+  dir="$(mktemp -d "$ACC_DIR/cancel.XXXXXX")"
   local out="$dir/cancel.bin.part"
   local meta="$dir/cancel.bin.hydra.json"
   local tmpp="$meta.tmp"
   local midway="" bytes="" rc=0 waited=0 pid
-
-  rm -rf "$dir"
-  mkdir -p "$dir"
   # Throttled run that cancels itself after 3 s, in the background so we can
   # first prove the partials really exist on disk.
   "$SPEEDTEST" "$url" 4 67108864 "$out" 0 3 >"$ACC_DIR/cancel.log" 2>&1 &
@@ -849,7 +849,11 @@ else
   echo "  ref url   : (unset - CDN stages 1-2 will SKIP; export HYDRA_REF_URL)"
 fi
 echo "  speedtest : $SPEEDTEST"
-echo "  temp dir  : $ACC_DIR (removed on exit)"
+if [ "${ACC_DIR_OWNED:-1}" = "1" ]; then
+  echo "  temp dir  : $ACC_DIR (removed on exit)"
+else
+  echo "  temp dir  : $ACC_DIR (HYDRA_ACC_DIR - KEPT on exit)"
+fi
 
 # preflight
 for cmd in python3 shasum awk; do
