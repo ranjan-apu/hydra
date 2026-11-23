@@ -26,6 +26,11 @@ pub struct Registry {
     /// Serialises settings writes: load-modify-save over a shared temp file must
     /// not interleave, or one partial update silently drops the other field.
     settings_lock: tokio::sync::Mutex<()>,
+    /// Serialises the whole start sequence. The concurrency cap, the per-path
+    /// ownership check and the insert are separate acquisitions of `inner`, so
+    /// two start IPCs could otherwise both pass the checks and both insert. One
+    /// guard around all of it makes the reservation atomic.
+    start_lock: tokio::sync::Mutex<()>,
 }
 
 /// Cap on simultaneously running downloads. Each run holds a coordinator fd plus
@@ -46,6 +51,7 @@ impl Registry {
             inner: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
             settings_lock: tokio::sync::Mutex::new(()),
+            start_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -139,6 +145,9 @@ pub async fn start_download(
     check_writable(&dir)?;
 
     let registry = app.state::<Registry>();
+    // Held until the handle is inserted: makes "is there room, is this path free"
+    // plus the insert one atomic decision.
+    let _start_guard = registry.start_lock.lock().await;
     // IPC is a trust boundary: nothing stops a caller from asking for twenty
     // simultaneous downloads, and each one costs a coordinator fd plus a worker
     // fd per connection. Cap the count and refuse a second run on the same file.
@@ -175,6 +184,9 @@ pub async fn start_download(
             part_path,
         },
     );
+    // The reservation is complete: release the start lock (and with it the borrow
+    // of app) before the forwarder takes ownership of the handle.
+    drop(_start_guard);
     spawn_forwarder(app, id.clone(), evt_rx);
     Ok(StartAck { id })
 }
@@ -222,8 +234,16 @@ pub async fn cancel_download(app: AppHandle, id: String) -> Result<(), String> {
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
     let sent = handle.ctrl.send(Ctrl::Cancel(Some(ack_tx))).is_ok();
     if sent {
-        // Bounded wait: a wedged engine must not wedge the IPC call.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await;
+        // Bounded wait: a wedged engine must not wedge the IPC call. No ack means
+        // the engine was already past the point of no return (it had renamed the
+        // file), so say that rather than claiming a clean cancel.
+        let acked = tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx)
+            .await
+            .is_ok();
+        if !acked {
+            registry.remove(&id);
+            return Err("the download had already finished".to_string());
+        }
     }
     registry.remove(&id);
     Ok(())
@@ -372,6 +392,10 @@ fn spawn_forwarder(app: AppHandle, id: String, mut rx: Receiver<EngineEvent>) {
                 }
             }
         }
+        // The engine is gone (it dropped its sender). Release the slot even when
+        // no terminal state arrived, or one dropped event would permanently eat a
+        // concurrency slot.
+        app.state::<Registry>().remove(&id);
     });
 }
 
@@ -400,22 +424,31 @@ fn check_writable(dir: &std::path::Path) -> Result<(), String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let probe = dir.join(format!(
-        ".hydra-write-probe-{}-{}",
-        std::process::id(),
-        nanos
-    ));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-    {
-        Err(e) => Err(engine::errors::write_error(Some(dir), &e)),
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            Ok(())
+    static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Retry rather than report a collision as a write failure: the name is
+    // unlikely but not impossible to take, and the answer to that is another name.
+    for _ in 0..8 {
+        let seq = PROBE_SEQ.fetch_add(1, Ordering::SeqCst);
+        let probe = dir.join(format!(
+            ".hydra-write-probe-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            seq
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(engine::errors::write_error(Some(dir), &e)),
         }
     }
+    Err("destination is not writable".to_string())
 }
 
 #[cfg(test)]

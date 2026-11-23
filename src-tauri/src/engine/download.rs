@@ -61,7 +61,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// and message the user will ever see.
 pub const EVENT_QUEUE_CAP: usize = 128;
 /// Upper bound on how long a state event may wait for queue space.
-const STATE_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+///
+/// Generous on purpose: progress frames drop when the queue is full, so the queue
+/// can only be full of progress and it always drains. A short budget would drop
+/// the one event that carries the final path or the error message.
+const STATE_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Control messages the embedder sends into a running engine.
 #[derive(Debug)]
@@ -928,9 +932,15 @@ async fn save_meta_offline(
         }
         // Durability order: a sidecar may only claim bytes that are themselves on
         // the disk, or a crash leaves done-counts ahead of the data and a resume
-        // skips the missing holes.
+        // skips the missing holes. A failed fsync therefore FAILS the save.
         if let Ok(f) = OpenOptions::new().write(true).open(&part_path) {
-            let _ = f.sync_data();
+            f.sync_data()?;
+        }
+        // Re-check: the cancel can land while the fsync above is running, and a
+        // rename after that point would resurrect the sidecar cancel promised to
+        // delete (N4).
+        if cancelling.load(Ordering::SeqCst) {
+            return Ok(());
         }
         save_meta_snapshot(&path, &url, size, chunk_size, &workers)
     })
@@ -1003,6 +1013,10 @@ struct Active {
     handles: Vec<JoinHandle<()>>,
     msgs_rx: UnboundedReceiver<WorkerMsg>,
     completed: usize,
+    /// Shared "the user cancelled" flag. It lives on the run rather than being
+    /// threaded separately because it describes the run's lifecycle, and the
+    /// token cannot serve: the token is also cancelled on pause, which must flush.
+    cancelling: Arc<AtomicBool>,
 }
 
 fn build_run(plan: &Plan) -> RunShared {
@@ -1081,6 +1095,7 @@ fn spawn_all(
         handles,
         msgs_rx,
         completed: 0,
+        cancelling: Arc::clone(cancelling),
     }
 }
 
@@ -1196,9 +1211,25 @@ async fn finalize(
     events: &Sender<EngineEvent>,
     active: &mut Active,
     coord: &Arc<File>,
+    ctrl_rx: &mut UnboundedReceiver<Ctrl>,
 ) {
     active.token.cancel();
     join_bounded(&mut active.handles, Duration::from_secs(1)).await;
+
+    // A cancel queued while the workers were being joined wins here: nothing has
+    // been renamed yet, so "delete it" is still unambiguous. Without this the
+    // cancel is never acked and the caller waits out its budget while a finished
+    // file appears anyway.
+    while let Ok(pending) = ctrl_rx.try_recv() {
+        if let Ctrl::Cancel(ack) = pending {
+            active.cancelling.store(true, Ordering::SeqCst);
+            cleanup_cancel(spec).await;
+            if let Some(tx) = ack {
+                let _ = tx.send(());
+            }
+            return;
+        }
+    }
     let speed = run.speed_bps.load(Ordering::SeqCst);
     emit_progress(events, build_progress(run, plan.size, speed));
 
@@ -1359,7 +1390,16 @@ pub async fn run(
     let _ = flush_meta(&spec, &plan, &run, &cancelling).await;
     let mut active = spawn_all(&spec, &plan, &run, &events, &token, &cancelling);
     if run.workers.is_empty() {
-        finalize(&spec, &plan, &run, &events, &mut active, &coord).await;
+        finalize(
+            &spec,
+            &plan,
+            &run,
+            &events,
+            &mut active,
+            &coord,
+            &mut ctrl_rx,
+        )
+        .await;
         return;
     }
 
@@ -1426,7 +1466,16 @@ pub async fn run(
             Next::Completed => {
                 active.completed += 1;
                 if active.completed >= run.workers.len() {
-                    finalize(&spec, &plan, &run, &events, &mut active, &coord).await;
+                    finalize(
+                        &spec,
+                        &plan,
+                        &run,
+                        &events,
+                        &mut active,
+                        &coord,
+                        &mut ctrl_rx,
+                    )
+                    .await;
                     return;
                 }
             }
