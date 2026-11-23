@@ -1,88 +1,91 @@
 # Hydra test harness (scripts/)
 
-Owner: **testlab**. These scripts exercise the downloader end-to-end without
-the GUI. `scripts/acceptance.sh` is the acceptance gate the orchestrator
-(lead) runs once the Rust backend builds; `scripts/testserver.py` is the
-controllable local server the harness points the headless `speedtest`
-example at. Neither script touches anything outside `scripts/` and
-`/tmp/hydra-acc/`.
+Owner: **testlab / lead**. These scripts exercise the downloader end-to-end
+without the GUI. `scripts/acceptance.sh` is the acceptance gate;
+`scripts/testserver.py` is the controllable local origin the headless
+`speedtest` example points at.
 
 ## Running
 
 ```bash
-scripts/acceptance.sh              # full acceptance (CDN stages need HYDRA_REF_URL; SKIP without it)
+scripts/acceptance.sh              # full gate (CDN stages need HYDRA_REF_URL; they SKIP without it)
 scripts/acceptance.sh <REF_URL>    # same stages against a different target
 ```
 
-Requirements: `cargo` (`~/.cargo/bin` is added to PATH automatically),
-`python3`, `shasum`, `awk` - all base macOS tools. Stages 1-2 need
-internet access to the reference CDN; stages 3-5 are localhost-only and never
-touch the network. All scratch state is written under `/tmp/hydra-acc/` and
-deleted on exit, together with every `testserver.py` the script started.
+Requirements: `cargo`, `python3`, `shasum`, `awk` - all base macOS tools.
+Stages 1-2 need internet access to the reference CDN; every other stage is
+localhost-only and never touches the network.
+
+Scratch state lives in a `mktemp -d` directory (0700, unpredictable) that the
+EXIT trap removes along with every `testserver.py` the script started. The
+directory is never reused, so a killed run cannot leave a partial that a later
+run would "resume" by accident, and a squatted symlink has nowhere to sit.
+`HYDRA_ACC_DIR` overrides it if you want to keep the artefacts.
 Exit code is 0 iff the final line is `ACCEPTANCE: PASS`. Every speedtest
-invocation is wrapped in a watchdog (`timeout_run`: a background
-sleep+kill, since macOS has no GNU `timeout`), so a hung run can never hang
-the acceptance run itself.
+invocation is wrapped in a watchdog (`timeout_run`: a background sleep+kill,
+since macOS has no GNU `timeout`), so a hung run cannot hang the gate.
 
 ## The local test server
 
 ```bash
-python3 scripts/testserver.py --mode <range|norange|flaky> --port 8899 \
-        --file payload.bin [--drop-p 0.15]
+python3 scripts/testserver.py --mode <mode> --port 8899 --file payload.bin \
+        [--drop-p 0.15] [--stall-secs 45] [--stall-prefix 4096] [--rate-kib 0]
 ```
 
 | mode | ranged GET | HEAD | purpose |
 |---|---|---|---|
 | `range` | `206` + `Content-Range`, `Accept-Ranges: bytes` (`416` if unsatisfiable) | **405** | forces the probe's ranged-GET fallback and exercises 206 validation |
-| `norange` | always `200`, full body, `Accept-Ranges: none` | `200` (true headers) | forces the single-stream fallback (`single=1`) |
-| `flaky` | like `range`, but drops the connection mid-body with probability `--drop-p` after a random 0-256 KiB prefix; never drops the same byte-range twice in a row; 1-byte ranges are never dropped | 405 | exercises retry logic until it converges |
+| `norange` | always `200`, full body, `Accept-Ranges: none` | `200` | forces the single-stream fallback (`single=1`) |
+| `flaky` | like `range`, but drops mid-body with probability `--drop-p` after a random 0-256 KiB prefix; never drops the same range twice in a row; 1-byte probe ranges are never dropped | 405 | exercises retry convergence |
+| `oversend` | `206` whose body is LONGER than the declared `Content-Range` (`Content-Length` covers the excess, and the filler wraps around so the final chunk over-sends too) | 405 | pins the per-chunk byte cap: without one, writes spill into the next chunk |
+| `stall` | headers plus `--stall-prefix` bytes, then silence for `--stall-secs` with no FIN/RST; the same range is served in full on a later request | 405 | pins the 30 s read deadline: a client without one waits for the server |
+| `noadvertise` | real `206` + `Content-Range` | `200` with a truthful `Content-Length` but **no** `Accept-Ranges` | pins the active range verification (HEAD alone would settle for one connection) |
+| `nolength` | no `Content-Length`, close-delimited body | `200`, no length | pins the unknown-size path (`size=null`): one sequential stream, no sidecar |
 
-Every response carries `Content-Type: application/octet-stream`, a true
-`Content-Length`, and `Connection: close`. The server is threaded (16+
-concurrent connections), quiet, and robust against client aborts. The file is
-served at `/` regardless of its on-disk name; suffix (`bytes=-N`) and
-open-ended (`bytes=N-`) ranges are supported.
+Every response carries `Content-Type: application/octet-stream` and (except
+`nolength`) a true `Content-Length`. The server is threaded (16+ concurrent
+connections), quiet, and robust against client aborts. The file is served at
+`/` regardless of its on-disk name; suffix (`bytes=-N`) and open-ended
+(`bytes=N-`) ranges are supported. `--rate-kib` throttles each connection so a
+test can catch a transfer mid-flight.
 
 ## Stages
 
 | # | stage | proves |
 |---|---|---|
-| 0 | build | `cargo build --release --example speedtest` produces the CLI binary. On failure the run stops early (nothing else can execute) but still prints the summary table. |
-| 1 | throughput | 4 connections over the reference URL average >= 25.0 MiB/s (`avg_mibps` from `SUMMARY`); a 1-connection run is reported for contrast (informational, cannot fail the stage) |
-| 2 | resume | (a) fresh 512 MiB run -> shasum = REF; (b) delete `.part` + meta; (c) `run_seconds=6` must print `PAUSED bytes=<n>` with n>0 and leave `.part` + meta; (d) rerun to completion -> `SUMMARY resumed=1` and shasum == REF |
-| 3 | norange-fallback | server ignores Range -> engine falls back to one connection (`single=1`) and the bytes still match |
-| 4 | head-reject+ranges | HEAD 405 -> probe falls back to ranged GET; download runs 4 ranged connections (`single=0`), bytes match. The harness also self-checks HEAD=405 and `206` + `Content-Range: bytes 0-1023/67108864` directly against the server |
-| 5 | flaky-retry | with mid-body drops at p=0.2 the engine retries ranges to completion, bytes match |
-| 6 | unit | `cargo test` passes |
+| 0 | build | `cargo build --release --example speedtest` produces the CLI. On failure the run stops early but still prints the summary. |
+| 1 | throughput | 4 connections over the reference URL average >= 25.0 MiB/s; a 1-connection run is reported for contrast (informational) |
+| 2 | resume | (a) fresh 512 MiB run -> shasum = REF; (b) delete `.part`, sidecar **and the completed file**; (c) `run_seconds=6` must print `PAUSED bytes=<n>` with n>0 and leave `.part` + meta; (d) rerun -> `resumed=1` and shasum == REF |
+| 3 | norange-fallback | Range ignored -> one connection (`single=1`), bytes match |
+| 4 | head-reject+ranges | HEAD 405 -> ranged-GET probe; 4 ranged connections (`single=0`), bytes match; self-checks HEAD and `Content-Range` directly |
+| 5 | flaky-retry | mid-body drops at p=0.2 still converge; asserts `single=0` and bytes match |
+| 6 | cancel-cleanup | throttled run cancels itself at 3 s; first proves a real `.part` + sidecar existed, then asserts `.part`, `.hydra.json` and `.hydra.json.tmp` are all gone and that bytes > 0 had landed |
+| 7 | oversend-bytecap | a 206 carrying 64 KiB more than it declared still yields a byte-identical file; asserts `single=0` |
+| 8 | stall-timeout | a silent origin still completes, and the elapsed time proves the deadline fired: asserting only a lower bound would also pass a client that simply waited out the server |
+| 9 | probe-verify | HEAD 200 without `Accept-Ranges` is upgraded to multi-connection by the verification GET (`acceptsRanges=true`, `method=range`, size learned) |
+| 10 | unknown-size | `size=null` runs as one sequential stream, writes **no** sidecar, and the bytes match |
+| 11 | unit | `cargo test` passes |
 
-## Assumptions the orchestrator should double-check
+## Assumptions worth knowing
 
-1. **Data file location**: a completed run is expected to leave its bytes at
-   the `out` path (`.../full.part`, per CONTRACT.md's speedtest section);
-   if the binary instead renames `.part` away on completion, the harness
-   falls back to `out` minus `.part` before hashing.
-2. **Sidecar meta path**: `out` with `.part` replaced by `.hydra.json`
-   (CONTRACT.md). Stage 2 asserts this exact path exists after a pause.
+1. **Data file location**: a completed run leaves its bytes at `out` minus
+   `.part`. Stage 2 deletes that file before its resume leg - otherwise the
+   resumed run renames to `full (2)` while the hash helper keeps returning the
+   old `full`, and the byte-identity check silently compares a file with itself.
+2. **Sidecar meta path**: `out` with `.part` replaced by `.hydra.json`.
 3. **Stage 2 pause**: `run_seconds=6` assumes the reference target is slower
-   than ~85 MiB/s so the 512 MiB run cannot finish inside 6 s (CONTRACT.md
-   observes ~25.9 MiB/s sustained). A much faster server would finish before
-   pausing and the stage would FAIL with a note.
+   than ~85 MiB/s so a 512 MiB run cannot finish inside 6 s. A faster server
+   would finish first and the stage FAILs with a note.
 4. **`bytes=` on a resumed run** is not asserted (the contract does not say
-   whether it is the total on disk or only the newly downloaded bytes);
+   whether it is the total on disk or only newly downloaded bytes);
    `resumed=1` plus shasum equality is the criterion.
-5. **Flaky convergence**: the server never drops the same range twice in a
-   row, so an engine that re-requests the identical range converges in one
-   retry; one that resumes from the received offset converges statistically
-   (0.2^5 < 0.001 per chunk within a 5-retry budget).
-6. Stage 4 asserts `single=0` (multi-connection ranged path) and stage 3
-   asserts `single=1` per the CONTRACT.md fallback rules.
+5. **Ranged stages assert `single=0`** and the single-stream stages assert
+   `single=1`: a stage that silently degraded to one connection would otherwise
+   still look green.
 
-## Harness self-verification (testlab)
+## Harness self-verification
 
-Before handing over, testlab verified: `python3 -m py_compile` and
-`bash -n` clean; a localhost smoke run of every server mode (HEAD statuses,
-206/Content-Range, suffix/open-ended/416 ranges, no-range 200s, flaky
-drop + no-repeat rule, shasum equality) with no leftover processes; and a
-full dry-run of `acceptance.sh` against a contract-conformant stub
-speedtest (both the PASS and the FAIL propagation paths) using only
-localhost servers.
+`python3 -m py_compile` and `bash -n` are clean; every server mode is smoke
+tested on localhost (HEAD statuses, 206/Content-Range, suffix/open-ended/416
+ranges, no-range 200s, oversend, stall, noadvertise, nolength, shasum equality)
+with no leftover processes.
