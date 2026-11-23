@@ -50,6 +50,12 @@ pub fn save_atomic(path: &Path, meta: &MetaFile) -> std::io::Result<()> {
 /// Public because cancel cleanup must be able to remove a temp file that an
 /// in-flight save left behind; keeping the naming here means there is exactly
 /// one definition of it.
+///
+/// The name is deterministic on purpose. A unique-per-save temp would make a
+/// crashed save's leftover impossible to name, so cancel could not sweep it; and
+/// two concurrent saves of one path cannot happen by construction (the monitor is
+/// the only writer, and it is joined before the pause flush). A leftover is also
+/// self-healing: the next save truncates the same path before renaming.
 pub fn tmp_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(".tmp");
