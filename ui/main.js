@@ -108,7 +108,9 @@
     cells: [],
     ariaPct: -1,
     liveConns: 0,
-    controlPending: false,
+    controlBusy: {},              // id -> true while a pause/cancel is in flight
+    pending: null,                // authoritative args of a start that has not acked yet
+    adoptedId: null,              // id adopted from an event that beat that ack
     deadIds: {},
     unlisten: []
   };
@@ -195,10 +197,50 @@
     return S.view === "compose" ? null : S.items[S.view] || null;
   }
 
+  function makeItem(id, args) {
+    return {
+      id: id,
+      url: args.url,
+      filename: args.filename,
+      destDir: args.destDir,
+      connections: args.connections,
+      size: args.size,
+      acceptsRanges: args.acceptsRanges,
+      state: "downloading",
+      bytesDone: 0,
+      total: args.size,
+      speedBps: 0,
+      etaSecs: null,
+      conns: [],
+      note: "",
+      error: "",
+      path: null,
+      doneSize: null
+    };
+  }
+
+  // Idempotent on purpose: an event can beat the start ack, in which case the row
+  // already exists when the ack lands and must be reconciled rather than appended
+  // (a second entry would strand a row no counter ever updates again).
   function addItem(item) {
+    var existing = S.items[item.id];
+    if (existing) {
+      if (item.url) existing.url = item.url;
+      if (item.filename) existing.filename = item.filename;
+      if (item.destDir) existing.destDir = item.destDir;
+      if (item.connections) existing.connections = item.connections;
+      if (item.size != null) {
+        existing.size = item.size;
+        if (existing.total == null) existing.total = item.size;
+      }
+      if (item.acceptsRanges != null) existing.acceptsRanges = item.acceptsRanges;
+      updateRow(item.id);
+      return existing;
+    }
     S.items[item.id] = item;
     S.order.unshift(item.id);
     rebuildList();
+    return item;
   }
 
   function dropItem(id) {
@@ -324,6 +366,7 @@
 
   function setView(view, announce) {
     S.view = view;
+    S.ariaPct = -1;
     document.body.dataset.view = view === "compose" ? "compose" : "detail";
     els.composeView.hidden = view !== "compose";
     els.detailView.hidden = view === "compose";
@@ -387,8 +430,9 @@
 
     var active = activeCount();
     els.sidebarCount.textContent = active === 0 ? "" : active + " active";
-    els.newBtn.disabled = active >= MAX_CONCURRENT;
-    els.newBtn.title = els.newBtn.disabled ? "Up to " + MAX_CONCURRENT + " downloads at once" : "";
+    // Navigation is never gated: at the cap the user still needs to get back to
+    // the compose form (and to a row, to free a slot). Only Start is disabled.
+    els.newBtn.title = "";
   }
 
   // ---------- compose ----------
@@ -541,39 +585,37 @@
       acceptsRanges: S.probe.acceptsRanges
     };
     S.starting = true;
+    S.pending = args;
+    S.adoptedId = null;
     S.composeError = "";
     renderCompose();
     els.primaryBtn.disabled = true;
     try {
       var res = await invoke("start_download", args);
-      if (!S.starting) return;
-      S.starting = false;
       if (!res || !res.id) throw new Error("engine did not return an id");
-      addItem({
-        id: res.id,
-        url: args.url,
-        filename: args.filename,
-        destDir: args.destDir,
-        connections: args.connections,
-        size: args.size,
-        acceptsRanges: args.acceptsRanges,
-        state: "downloading",
-        bytesDone: 0,
-        total: args.size,
-        speedBps: 0,
-        etaSecs: null,
-        conns: [],
-        note: "",
-        error: "",
-        path: null,
-        doneSize: null
-      });
-      setView(res.id);
+      var adopted = S.adoptedId;
+      S.starting = false;
+      S.pending = null;
+      S.adoptedId = null;
+      // An event may have created the row already; keep the id the engine
+      // actually returned and drop an adopted row that disagrees with it.
+      if (adopted && adopted !== res.id) dropItem(adopted);
+      var item = addItem(makeItem(res.id, args));
+      setView(item.id);
       resetCompose();
     } catch (err) {
+      var adoptedOnError = S.adoptedId;
       S.starting = false;
-      S.composeError = errText(err);
-      renderCompose();
+      S.pending = null;
+      S.adoptedId = null;
+      if (adoptedOnError) {
+        // The run is real even though the reply was lost.
+        setView(adoptedOnError);
+        resetCompose();
+      } else {
+        S.composeError = errText(err);
+        renderCompose();
+      }
     }
   }
 
@@ -636,6 +678,7 @@
     if (item.state === "done") {
       els.barFill.style.width = "100%";
       els.progressPct.textContent = "100%";
+      S.ariaPct = 100;
       els.barTrack.setAttribute("aria-valuenow", "100");
       els.barTrack.setAttribute("aria-valuetext", "100 percent, download complete");
     } else {
@@ -670,10 +713,12 @@
     var conns = item.conns || [];
     S.liveConns = conns.length || item.connections;
     els.connGrid.hidden = S.liveConns <= 1 || item.state === "done";
+    // Keyed on the run as well as the count: selecting a run that has not
+    // reported a frame yet must clear the previous run's teeth, not inherit them.
     var key = item.id + ":" + conns.length;
-    if (conns.length > 0 && (S.gridKey !== key || (S.cells.length !== conns.length))) {
-      buildConnGrid(conns.length);
+    if (S.gridKey !== key || S.cells.length !== conns.length) {
       S.gridKey = key;
+      buildConnGrid(conns.length);
     }
     if (conns.length === 0) {
       els.connSummary.textContent = "0/" + item.connections + " complete";
@@ -746,9 +791,14 @@
       show(els.removeBtn, false);
       show(els.revealBtn, false);
       show(els.primaryBtn, true);
+      var atCap = activeCount() >= MAX_CONCURRENT;
       els.primaryBtn.textContent = "Start download";
-      els.primaryBtn.disabled = !S.probe || !S.settings.destDir || S.starting || S.composeState === "probing";
-      if (S.composeState === "probing") {
+      els.primaryBtn.disabled = !S.probe || !S.settings.destDir || S.starting ||
+        S.composeState === "probing" || atCap;
+      if (atCap) {
+        hint = "Up to " + MAX_CONCURRENT + " at once - cancel one to start another";
+        tone = "warn";
+      } else if (S.composeState === "probing") {
         hint = "";
       } else if (S.probe && !S.settings.destDir) {
         hint = "Choose a destination folder to continue";
@@ -793,34 +843,22 @@
 
   function onState(p) {
     if (!p) return;
-    if (p.id != null && S.deadIds[p.id]) return;
+    // A terminal event is how a run leaves the list, so it is never stale:
+    // suppressing it while a cancel is in flight would both strand the row and
+    // turn the engine's "already finished" reply into a false failure.
+    var terminal = p.state === "done" || p.state === "error";
+    if (p.id != null && S.deadIds[p.id] && !terminal) return;
 
     var item = p.id != null ? S.items[p.id] : null;
-    if (!item && S.starting && p.state === "downloading") {
-      // The engine announced the run before the start ack landed: adopt it.
-      S.starting = false;
-      addItem({
-        id: p.id,
-        url: "",
-        filename: currentFilename() || "download",
-        destDir: S.settings.destDir || "",
-        connections: S.settings.connections,
-        size: null,
-        acceptsRanges: !!(S.probe && S.probe.acceptsRanges),
-        state: "downloading",
-        bytesDone: 0,
-        total: null,
-        speedBps: 0,
-        etaSecs: null,
-        conns: [],
-        note: "",
-        error: "",
-        path: null,
-        doneSize: null
-      });
+    if (!item && p.id != null && S.starting && S.pending && !S.adoptedId) {
+      // An event beat the start ack. Build the row from the request we actually
+      // sent - not from the event - or a later retry inherits an empty url, an
+      // unknown size and no range answer. The ack reconciles it by id.
+      S.adoptedId = p.id;
+      item = addItem(makeItem(p.id, S.pending));
+      item.state = p.state;
       setView(p.id);
       resetCompose();
-      item = S.items[p.id];
     }
     if (!item) return;
 
@@ -898,8 +936,8 @@
   }
 
   async function cancelItem(item) {
-    if (S.controlPending) return;
-    S.controlPending = true;
+    if (S.controlBusy[item.id]) return;
+    S.controlBusy[item.id] = true;
     S.deadIds[item.id] = 1;
     try {
       await invoke("cancel_download", { id: item.id });
@@ -920,25 +958,31 @@
       }
       renderChrome();
     } finally {
-      S.controlPending = false;
+      delete S.controlBusy[item.id];
     }
   }
 
   async function togglePause(item) {
-    if (S.controlPending) return;
+    if (S.controlBusy[item.id]) return;
     if (item.state !== "downloading" && item.state !== "paused") return;
-    S.controlPending = true;
+    S.controlBusy[item.id] = true;
     els.pauseBtn.disabled = true;
     try {
       if (item.state === "paused") await invoke("resume_download", { id: item.id });
       else await invoke("pause_download", { id: item.id });
     } catch (err) {
+      // A pause can fail for real (the flush failed), so the row has to say so
+      // instead of keeping a stale "downloading" that still counts toward the cap.
       item.state = "error";
       item.error = errText(err);
+      item.speedBps = 0;
+      item.etaSecs = null;
+      S.dirty[item.id] = true;
+      scheduleFlush();
       if (S.view === item.id) renderDetail(true);
       renderChrome();
     } finally {
-      S.controlPending = false;
+      delete S.controlBusy[item.id];
       els.pauseBtn.disabled = false;
     }
   }
@@ -961,35 +1005,29 @@
       acceptsRanges: item.acceptsRanges !== false
     };
     S.starting = true;
+    S.pending = args;
+    S.adoptedId = null;
     try {
       var res = await invoke("start_download", args);
-      S.starting = false;
       if (!res || !res.id) throw new Error("engine did not return an id");
-      dropItem(item.id);
-      addItem({
-        id: res.id,
-        url: item.url,
-        filename: item.filename,
-        destDir: item.destDir,
-        connections: item.connections,
-        size: item.size,
-        state: "downloading",
-        bytesDone: 0,
-        total: item.size,
-        speedBps: 0,
-        etaSecs: null,
-        conns: [],
-        note: "",
-        error: "",
-        path: null,
-        doneSize: null
-      });
-      setView(res.id);
-    } catch (err) {
+      var adopted = S.adoptedId;
       S.starting = false;
-      item.state = "error";
-      item.error = errText(err);
-      renderDetail(true);
+      S.pending = null;
+      S.adoptedId = null;
+      if (adopted && adopted !== res.id) dropItem(adopted);
+      if (S.items[item.id]) dropItem(item.id);
+      var fresh = addItem(makeItem(res.id, args));
+      setView(fresh.id);
+    } catch (err) {
+      var adoptedOnError = S.adoptedId;
+      S.starting = false;
+      S.pending = null;
+      S.adoptedId = null;
+      if (!adoptedOnError) {
+        item.state = "error";
+        item.error = errText(err);
+        renderDetail(true);
+      }
     }
     renderChrome();
   }

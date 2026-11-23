@@ -152,6 +152,6 @@ teeth - because where it died is information.
 ## Responsive
 
 The window is resizable (1080x720 default, 900x620 minimum - the rail costs 248px, so the
-minimum rose with it). At <=920px the rail narrows to 210px; in a browser below the app's own
+minimum rose with it). At <=900px the rail narrows to 210px; in a browser below the app's own
 minimum the meta grid drops to two columns, the comb to four, the action hint retires and the
 stat row to two columns.

@@ -81,7 +81,7 @@
     emit("hydra://state", {
       id: run.id,
       state: "done",
-      path: settings.destDir + "/" + run.filename,
+      path: (run.destDir || settings.destDir) + "/" + run.filename,
       size: run.total
     });
   }
@@ -145,12 +145,15 @@
           case "start_download": {
             var id = "dl-" + nextId++;
             var scripted = queue.shift() || {};
+            // Mirror the Rust limit (16), not an arbitrary 8.
+            var n = Math.min(args.connections || 8, 16);
             var run = {
               id: id,
               filename: args.filename,
+              destDir: args.destDir,
               total: args.size || 7772412965,
-              connections: Math.min(args.connections || 8, 8),
-              conns: plan(Math.min(args.connections || 8, 8), args.size || 7772412965),
+              connections: n,
+              conns: plan(n, args.size || 7772412965),
               speed: 38170000,
               paused: false,
               state: "downloading",
@@ -160,6 +163,9 @@
             runs[id] = run;
             resolve({ id: id });
             setTimeout(function () {
+              // A cancel can land inside this window; a cancelled run must not
+              // start emitting afterwards.
+              if (!runs[id]) return;
               emit("hydra://state", { id: id, state: "downloading", note: null });
               // Land on the scripted fraction immediately so the demo is
               // deterministic; a fractional hold then keeps ticking so it looks
@@ -193,6 +199,7 @@
             var r2 = runs[args.id];
             if (r2) {
               r2.paused = false;
+              r2.holdAt = null; // a resumed run keeps going past the scripted hold
               emit("hydra://state", { id: args.id, state: "downloading" });
               if (!r2.timer) r2.timer = setInterval(function () { tick(r2); }, SNAP ? 60 : 250);
             }
@@ -218,8 +225,12 @@
     core: { invoke: invoke },
     event: {
       listen: function (name, cb) {
-        (listeners[name] = listeners[name] || []).push(cb);
-        return Promise.resolve(function () {});
+        var list = (listeners[name] = listeners[name] || []);
+        list.push(cb);
+        return Promise.resolve(function () {
+          var at = list.indexOf(cb);
+          if (at >= 0) list.splice(at, 1);
+        });
       }
     }
   };

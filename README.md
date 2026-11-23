@@ -113,10 +113,12 @@ The frontend runs in a plain browser against a mock that implements the exact
 Tauri contract:
 
     python3 -m http.server 8801
-    open "http://127.0.0.1:8801/ui/index.html?demo=downloading"
+    open "http://127.0.0.1:8801/ui/index.html?demo=multi"
 
-Demo states: idle | probing | ready | resume | downloading | paused | done |
-error | single. Add &snap=1 to resolve instantly for a deterministic screenshot.
+Demo states: compose | ready | done | error | multi. `multi` drives the real UI
+path - it types a URL, probes, starts five runs and then moves them into paused,
+complete and failed - so the rail and every detail state render from the shipping
+code. Add &snap=1 to resolve instantly for a deterministic screenshot.
 Inside real Tauri the mock stands aside automatically (it installs
 window.__TAURI__ only when the runtime has not already provided it).
 

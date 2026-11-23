@@ -89,9 +89,10 @@ Stops workers, DELETES <filename>.part, <filename>.hydra.json and any
 
 The command resolves only AFTER the files are gone: the engine signals a oneshot
 ack that the bridge awaits (10 s upper bound). The reply therefore means "the
-partial download no longer exists", which the UI relies on - it re-checks for a
-resumable partial immediately after cancelling, and a following run on the same
-filename must not be able to race the cleanup sweep.
+partial download no longer exists", which the UI relies on - it removes the row
+when the reply lands (and, being session-only, keeps no state that could describe
+a file that no longer exists). A following run on the same filename must not be
+able to race the cleanup sweep.
 
 Cancelling is the explicit "throw it away" action. A failed run does NOT delete
 anything: the .part and sidecar are deliberately kept so "Try again" and a later
