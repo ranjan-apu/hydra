@@ -1,127 +1,180 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="color-scheme" content="dark" />
-  <title>Hydra</title>
-  <link rel="stylesheet" href="ui.css" />
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<title>Hydra</title>
+<link rel="stylesheet" href="ui.css" />
 </head>
 <body data-state="idle">
 
-  <header class="titlebar" data-tauri-drag-region>
-    <span class="wordmark">HYDRA</span>
+  <header class="titlebar" data-tauri-drag-region="deep">
+    <div class="brand">
+      <div class="brand-mark" id="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+      <div class="brand-text">
+        <h1>Hydra</h1>
+        <p>parallel download engine</p>
+      </div>
+    </div>
+    <div class="titlebar-right">
+      <span class="engine-badge" id="engine-badge" hidden>Engine ready</span>
+      <span class="status-pill" id="status-pill" data-tone="idle">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="status-text">Starting&hellip;</span>
+      </span>
+    </div>
   </header>
 
   <main class="content">
 
-    <section class="url-area" aria-label="New download">
-      <input id="url-input" class="url-input" type="text" placeholder="Paste a download URL..."
-             inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false"
-             aria-label="Download URL" />
-      <p id="url-msg" class="url-msg" role="status" aria-live="polite">
-        <svg class="spinner" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false">
-          <circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="2.2"
-                  stroke-linecap="round" stroke-dasharray="22 12.3" />
+    <section class="card" id="source-card" aria-labelledby="h-source">
+      <div class="step-head">
+        <span class="step-num" aria-hidden="true">01</span>
+        <h2 id="h-source">Source</h2>
+      </div>
+      <div class="url-wrap" id="url-wrap">
+        <svg class="url-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
         </svg>
-        <span id="url-msg-text"></span>
+        <input id="url-input" type="text" inputmode="url" spellcheck="false" autocomplete="off"
+               autocapitalize="off" placeholder="Paste a download URL"
+               aria-label="Download URL" />
+        <button id="probe-btn" class="probe-btn" type="button">Probe</button>
+      </div>
+      <p id="url-msg" class="hint" role="status" aria-live="polite">
+        <svg class="spinner" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false">
+          <circle cx="8" cy="8" r="5.6" fill="none" stroke="currentColor" stroke-width="2.2"
+                  stroke-linecap="round" stroke-dasharray="23 12" />
+        </svg>
+        <span id="url-msg-text">Paste a URL and press Enter to check the origin.</span>
       </p>
-    </section>
-
-    <section id="ready-card" class="card ready-card" hidden aria-label="Download details">
-      <div class="field-grid">
-        <label class="field-label" for="filename-input">Save as</label>
-        <input id="filename-input" class="filename-input" type="text" spellcheck="false"
-               autocomplete="off" aria-label="Save as file name" />
-      </div>
-      <div class="meta-row">
-        <span id="size-text" class="size-text num"></span>
-        <span id="ranges-badge" class="badge"></span>
-        <span id="type-chip" class="chip"></span>
-        <span id="resume-badge" class="badge badge-green" hidden></span>
-      </div>
-      <div class="field-grid">
-        <span class="field-label" id="save-label">Save to</span>
-        <span class="save-controls" id="save-controls">
-          <svg class="icon icon-folder" viewBox="0 0 14 14" width="13" height="13" aria-hidden="true" focusable="false">
-            <path d="M1.9 4.1c0-.61.5-1.1 1.11-1.1h2.63l1.3 1.5h3.96c.61 0 1.11.49 1.11 1.1v5.1c0 .61-.5 1.1-1.11 1.1H3.01c-.61 0-1.11-.49-1.11-1.1v-5.6z"
-                  fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
-          </svg>
-          <span id="dest-text" class="dest-text is-empty">No folder chosen</span>
-          <button id="choose-btn" class="btn btn-secondary btn-sm" type="button">Choose...</button>
-        </span>
-      </div>
-      <div class="field-grid">
-        <span class="field-label" id="conn-field-label">Connections</span>
-        <span class="conn-controls">
-          <span class="stepper" role="group" aria-labelledby="conn-field-label">
-            <button id="conn-minus" class="btn btn-step" type="button" aria-label="Decrease connections">&#8722;</button>
-            <span id="conn-value" class="step-value num" aria-live="polite">8</span>
-            <button id="conn-plus" class="btn btn-step" type="button" aria-label="Increase connections">+</button>
-          </span>
-          <span id="conn-note" class="conn-note" hidden></span>
-        </span>
-      </div>
-      <div class="action-row">
-        <span id="folder-prompt" class="folder-prompt" hidden>Choose a folder to continue</span>
-        <button id="download-btn" class="btn btn-primary" type="button">Download</button>
-      </div>
-    </section>
-
-    <section id="progress-card" class="card progress-card" hidden aria-label="Download progress">
-      <div class="progress-head">
-        <span id="dl-name" class="dl-name"></span>
-        <span id="speed-readout" class="speed-readout num"></span>
-      </div>
-      <div id="bar-track" class="bar-track"><div id="bar-fill" class="bar-fill"></div></div>
-      <p class="status-line num">
-        <span id="st-bytes" class="st-part"></span><span id="st-speed" class="st-part st-speed"></span><span id="st-eta" class="st-part st-eta"></span>
-      </p>
-      <p id="state-note" class="state-note" hidden></p>
-      <div id="conn-grid" class="conn-grid"></div>
       <div id="error-banner" class="error-banner" hidden role="alert">
-        <svg class="icon icon-dot" viewBox="0 0 12 12" width="11" height="11" aria-hidden="true" focusable="false">
-          <circle cx="6" cy="6" r="4.2" fill="currentColor" />
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true" focusable="false">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7.6v5M12 15.9v.1" stroke-linecap="round" />
         </svg>
         <span id="error-msg"></span>
       </div>
-      <div id="done-block" class="done-block" hidden>
-        <svg class="icon icon-check" viewBox="0 0 22 22" width="24" height="24" aria-hidden="true" focusable="false">
-          <circle cx="11" cy="11" r="9.4" fill="none" stroke="currentColor" stroke-width="1.5" />
-          <path d="M6.8 11.4l2.7 2.7 5.7-5.9" fill="none" stroke="currentColor" stroke-width="1.9"
-                stroke-linecap="round" stroke-linejoin="round" />
-        </svg>
-        <div class="done-info">
-          <div id="done-size" class="done-size num"></div>
-          <div class="done-path-row">
-            <svg class="icon icon-folder" viewBox="0 0 14 14" width="12" height="12" aria-hidden="true" focusable="false">
-              <path d="M1.9 4.1c0-.61.5-1.1 1.11-1.1h2.63l1.3 1.5h3.96c.61 0 1.11.49 1.11 1.1v5.1c0 .61-.5 1.1-1.11 1.1H3.01c-.61 0-1.11-.49-1.11-1.1v-5.6z"
-                    fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
-            </svg>
-            <span id="done-path" class="done-path"></span>
-          </div>
-        </div>
+    </section>
+
+    <section class="card" id="ready-card" aria-labelledby="h-details">
+      <div class="step-head">
+        <span class="step-num" aria-hidden="true">02</span>
+        <h2 id="h-details">File details</h2>
       </div>
-      <div class="action-row">
-        <button id="pause-btn" class="btn btn-secondary" type="button">Pause</button>
-        <button id="resume-btn" class="btn btn-secondary" type="button" hidden>Resume</button>
-        <button id="cancel-btn" class="btn btn-danger" type="button">Cancel</button>
-        <button id="retry-btn" class="btn btn-primary" type="button" hidden>Try again</button>
-        <button id="reveal-btn" class="btn btn-primary" type="button" hidden>
-          <svg class="icon icon-reveal" viewBox="0 0 14 14" width="13" height="13" aria-hidden="true" focusable="false">
-            <path d="M7 9.2V2.4M4.5 4.9L7 2.4l2.5 2.5" fill="none" stroke="currentColor" stroke-width="1.5"
-                  stroke-linecap="round" stroke-linejoin="round" />
-            <path d="M2.5 8.8v2.1c0 .6.45 1.1 1 1.1h7c.55 0 1-.5 1-1.1v-2.1" fill="none" stroke="currentColor"
-                  stroke-width="1.5" stroke-linecap="round" />
-          </svg>
-          Reveal in Finder
-        </button>
+      <p class="empty-note" id="details-empty">Size, range support, probe method and the answering server appear here.</p>
+      <div class="label-row">
+        <label class="field-label" for="filename-input">Filename</label>
+        <span id="type-chip" class="chip" hidden></span>
+      </div>
+      <input id="filename-input" class="text-input" type="text" spellcheck="false" autocomplete="off" />
+      <dl class="meta-grid">
+        <div class="meta-item">
+          <dt class="meta-key">Size</dt>
+          <dd class="meta-value num" id="meta-size"></dd>
+        </div>
+        <div class="meta-item">
+          <dt class="meta-key">Ranges</dt>
+          <dd class="meta-value"><span class="badge" id="meta-ranges"></span></dd>
+        </div>
+        <div class="meta-item">
+          <dt class="meta-key">Probe</dt>
+          <dd class="meta-value" id="meta-probe"></dd>
+        </div>
+        <div class="meta-item">
+          <dt class="meta-key">Server</dt>
+          <dd class="meta-value mono" id="meta-server"></dd>
+        </div>
+      </dl>
+      <div class="resume-note" id="resume-note" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" />
+        </svg>
+        <span id="resume-text"></span>
       </div>
     </section>
 
-    <p id="footer-hint" class="footer-hint">Downloads resume automatically if interrupted.</p>
+    <section class="card" id="dest-card" aria-labelledby="h-dest">
+      <div class="step-head">
+        <span class="step-num" aria-hidden="true">03</span>
+        <h2 id="h-dest">Destination</h2>
+      </div>
+      <button id="choose-btn" class="folder-box" type="button" aria-label="Choose destination folder">
+        <svg class="icon-folder" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4"
+             stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <path d="M2.6 6.2A1.7 1.7 0 0 1 4.3 4.5h3.1l1.7 1.9h6.7a1.7 1.7 0 0 1 1.7 1.7v6.4a1.7 1.7 0 0 1-1.7 1.7H4.3a1.7 1.7 0 0 1-1.7-1.7V6.2Z" />
+        </svg>
+        <span id="dest-text" class="dest-text mono is-empty">No folder chosen</span>
+        <span class="folder-cta">Choose&hellip;</span>
+      </button>
+      <div class="conn-block">
+        <div class="conn-head">
+          <label class="field-label" for="conn-range">Parallel connections</label>
+          <output id="conn-value" class="conn-value num" for="conn-range">8</output>
+        </div>
+        <input id="conn-range" type="range" min="1" max="16" step="1" value="8"
+               aria-describedby="conn-note" />
+        <div class="range-labels num" aria-hidden="true">
+          <span>1</span><span>4</span><span>8</span><span>12</span><span>16</span>
+        </div>
+        <p class="conn-note" id="conn-note" hidden></p>
+      </div>
+    </section>
 
+    <section class="card progress-card" id="progress-card" hidden aria-label="Download progress">
+      <div class="progress-title">
+        <span class="progress-file mono" id="dl-name"></span>
+        <span class="progress-pct num" id="progress-pct">0%</span>
+      </div>
+      <div class="bar-track" id="bar-track" role="progressbar" aria-label="Total progress"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="bar-fill" id="bar-fill"></div>
+      </div>
+      <div class="stats">
+        <div class="stat"><span class="stat-key">Speed</span><span class="stat-value num" id="stat-speed"></span></div>
+        <div class="stat"><span class="stat-key">Downloaded</span><span class="stat-value num" id="stat-bytes"></span></div>
+        <div class="stat"><span class="stat-key">ETA</span><span class="stat-value num" id="stat-eta"></span></div>
+      </div>
+      <div class="conn-summary" id="conn-summary-row">
+        <span class="conn-summary-key">Connections</span>
+        <span class="conn-summary-value num" id="conn-summary"></span>
+      </div>
+      <div class="conn-grid" id="conn-grid" aria-hidden="true"></div>
+      <p class="state-note" id="state-note" hidden></p>
+      <div class="transfer-error" id="transfer-error" hidden role="alert">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true" focusable="false">
+          <circle cx="12" cy="12" r="9" /><path d="M12 7.6v5M12 15.9v.1" stroke-linecap="round" />
+        </svg>
+        <span id="transfer-error-msg"></span>
+      </div>
+      <div class="done-panel" id="done-panel" hidden>
+        <span class="done-check" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+               stroke-linecap="round" stroke-linejoin="round" focusable="false">
+            <circle cx="12" cy="12" r="9.2" /><path d="m7.4 12.4 3 3 6.2-6.4" />
+          </svg>
+        </span>
+        <span class="done-copy">
+          <strong id="done-title">Download complete</strong>
+          <span class="done-path mono" id="done-path"></span>
+        </span>
+        <button id="reveal-btn" class="btn btn-secondary" type="button">Reveal in Finder</button>
+      </div>
+    </section>
+
+    <p class="footer-note" id="footer-note">Downloads resume automatically if interrupted. No telemetry, no accounts.</p>
   </main>
+
+  <footer class="action-bar">
+    <span class="action-hint" id="action-hint" hidden></span>
+    <button id="cancel-btn" class="btn btn-ghost" type="button" hidden>Cancel</button>
+    <button id="pause-btn" class="btn btn-secondary" type="button" hidden>Pause</button>
+    <button id="primary-btn" class="btn btn-primary" type="button" disabled>Start download</button>
+  </footer>
 
   <script src="mock-tauri.js"></script>
   <script src="main.js"></script>
