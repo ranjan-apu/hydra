@@ -45,6 +45,11 @@ Acceptance run (real CDN, reference file 7.77 GB, this checkout, scripts/accepta
 6. Parallel ranged download; chunk = ceil(size / N), last chunk clamped to size-1
 7. Live progress: rolling ~2 s speed, bytes done/total, ETA, per-connection fill bars
    (events at >= 4 Hz)
+7a. Several downloads at once: a left rail lists every run (live and finished) with its own
+   progress and state, "New download" returns to the setup form without disturbing anything
+   already transferring, and selecting a row shows that run's detail. Up to 8 concurrent runs;
+   each has its own cancel/pause/resume. A finished row can be forgotten; a live one is
+   cancelled and its partial data deleted.
 8. Pause / Resume / Cancel - pause keeps .part + meta so Resume can continue; Cancel
    deletes the half-downloaded .part, its .hydra.json sidecar and any leftover .tmp, so a
    cancelled download leaves nothing behind

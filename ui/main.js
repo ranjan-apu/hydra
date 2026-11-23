@@ -1,13 +1,16 @@
 /* main.js — Hydra frontend.
+
+ * One window, many downloads: a sidebar lists every run (live and finished) and
+ * the pane shows either the compose form or the selected run's detail.
  *
  * Talks ONLY to window.__TAURI__ (Tauri v2, withGlobalTauri):
- *   await window.__TAURI__.core.invoke(name, args)   — camelCase arg keys per CONTRACT.md
+ *   await window.__TAURI__.core.invoke(name, args)   — camelCase keys per CONTRACT.md
  *   await window.__TAURI__.event.listen(name, cb)    — payload at cb.payload
  *
- * State machine: idle -> probing -> ready -> downloading -> paused -> done | error
- * (error -> ready via "Try again"; done -> idle via "Start another download").
- * Speed and ETA always come from the backend (hydra://progress); this file only
- * formats IEC bytes, MiB/s and "4m 12s".
+ * Two independent state machines:
+ *   - the compose form in the pane: idle -> probing -> ready
+ *   - each download item in the sidebar: downloading -> paused -> done | error
+ * Speed and ETA always come from the backend; this file only formats.
  */
 
 "use strict";
@@ -21,6 +24,12 @@
     statusPill: $("status-pill"),
     statusText: $("status-text"),
 
+    newBtn: $("new-btn"),
+    sidebarCount: $("sidebar-count"),
+    dlList: $("dl-list"),
+    listEmpty: $("list-empty"),
+
+    composeView: $("compose-view"),
     sourceCard: $("source-card"),
     urlWrap: $("url-wrap"),
     urlInput: $("url-input"),
@@ -46,9 +55,11 @@
     connRange: $("conn-range"),
     connValue: $("conn-value"),
     connNote: $("conn-note"),
+    footerNote: $("footer-note"),
 
-    progressCard: $("progress-card"),
+    detailView: $("detail-view"),
     dlName: $("dl-name"),
+    dlSub: $("dl-sub"),
     progressPct: $("progress-pct"),
     barTrack: $("bar-track"),
     barFill: $("bar-fill"),
@@ -64,52 +75,42 @@
     donePanel: $("done-panel"),
     doneTitle: $("done-title"),
     donePath: $("done-path"),
-    revealBtn: $("reveal-btn"),
 
-    footerNote: $("footer-note"),
     actionHint: $("action-hint"),
     cancelBtn: $("cancel-btn"),
     pauseBtn: $("pause-btn"),
+    removeBtn: $("remove-btn"),
+    revealBtn: $("reveal-btn"),
     primaryBtn: $("primary-btn")
   };
 
   var MIN_CONNECTIONS = 1;
   var MAX_CONNECTIONS = 16;
+  var MAX_CONCURRENT = 8;
 
   var S = {
-    state: "idle",
+    view: "compose",              // "compose" | download id
+    order: [],                    // ids, newest first
+    items: {},                    // id -> item
+    rowEls: {},                   // id -> { li, btn, name, pct, fill, state }
+
     settings: { destDir: null, connections: 8 },
     probe: null,
-    dlId: null,
-    starting: false,
-    finalPath: null,
-    lastProgress: null,
-    rafPending: false,
-    cells: [],
-    gridFor: -1,
-    metaSeq: 0,
-    controlPending: false,
-    ariaPct: -1,
-    stepperLocked: false,
-    note: "",
-    liveConns: 0,
-    /// Generation counter for probe results: a late reply for an abandoned URL
-    /// must never be applied (it would show one file and download another).
     probeSeq: 0,
-    /// Ids of runs that are already over. Their late events are ignored, so a
-    /// cancelled download cannot flip the next screen to paused/done.
-    deadIds: Object.create(null),
-    unlisten: []
-  };
+    metaSeq: 0,
+    composeState: "idle",         // idle | probing | ready
+    composeError: "",
+    starting: false,
 
-  var STATUS = {
-    idle: { label: "Idle", tone: "idle" },
-    probing: { label: "Probing", tone: "busy" },
-    ready: { label: "Ready", tone: "ready" },
-    downloading: { label: "Downloading", tone: "live" },
-    paused: { label: "Paused", tone: "warn" },
-    done: { label: "Complete", tone: "ok" },
-    error: { label: "Failed", tone: "error" }
+    rafPending: false,
+    dirty: {},
+    gridKey: "",
+    cells: [],
+    ariaPct: -1,
+    liveConns: 0,
+    controlPending: false,
+    deadIds: {},
+    unlisten: []
   };
 
   function invoke(name, args) {
@@ -122,7 +123,7 @@
     return String(err);
   }
 
-  // ---------- formatting (the UI never computes speed or ETA) ----------
+  // ---------- formatting ----------
 
   function formatBytes(n) {
     if (n == null || !isFinite(n)) return "Unknown size";
@@ -138,7 +139,7 @@
 
   function formatSpeed(bps) {
     if (bps == null || !isFinite(bps)) return "\u2014";
-  if (bps <= 0) return "0.0 MiB/s";
+    if (bps <= 0) return "0.0 MiB/s";
     return (bps / 1048576).toFixed(1) + " MiB/s";
   }
 
@@ -146,9 +147,7 @@
     if (secs == null || !isFinite(secs) || secs < 0) return "\u2014";
     secs = Math.round(secs);
     if (secs < 60) return secs + "s";
-    if (secs < 3600) {
-      return Math.floor(secs / 60) + "m " + String(secs % 60).padStart(2, "0") + "s";
-    }
+    if (secs < 3600) return Math.floor(secs / 60) + "m " + String(secs % 60).padStart(2, "0") + "s";
     return Math.floor(secs / 3600) + "h " + String(Math.floor((secs % 3600) / 60)).padStart(2, "0") + "m";
   }
 
@@ -160,7 +159,7 @@
     return text.slice(0, head) + "\u2026" + text.slice(text.length - tail);
   }
 
-  function pct(done, total) {
+  function pctOf(done, total) {
     if (total == null || !isFinite(total) || total <= 0) return null;
     var d = Number(done);
     if (!isFinite(d) || d < 0) d = 0;
@@ -173,203 +172,262 @@
     return Math.min(MAX_CONNECTIONS, Math.max(MIN_CONNECTIONS, v));
   }
 
-  // ---------- state ----------
+  var STATE_LABEL = {
+    downloading: "downloading",
+    paused: "paused",
+    done: "complete",
+    error: "failed",
+    ready: "starting"
+  };
 
-  function setState(next) {
-    S.state = next;
-    document.body.dataset.state = next;
-    var s = STATUS[next] || STATUS.idle;
-    els.statusText.textContent = s.label;
-    els.statusPill.dataset.tone = s.tone;
-    render();
+  // ---------- items ----------
+
+  function activeCount() {
+    var n = 0;
+    for (var i = 0; i < S.order.length; i++) {
+      var st = S.items[S.order[i]].state;
+      if (st === "downloading" || st === "paused") n++;
+    }
+    return n;
   }
 
-  function currentFilename() {
-    var v = els.filenameInput.value.trim();
-    if (v) return v;
-    return S.probe ? S.probe.filename : "";
+  function selected() {
+    return S.view === "compose" ? null : S.items[S.view] || null;
   }
 
-  // ---------- render ----------
+  function addItem(item) {
+    S.items[item.id] = item;
+    S.order.unshift(item.id);
+    rebuildList();
+  }
 
-  function render() {
-    var st = S.state;
-    var active = st === "downloading" || st === "paused";
-    var failed = st === "error";
-    var finished = st === "done";
-    var live = active || failed;
+  function dropItem(id) {
+    delete S.items[id];
+    var at = S.order.indexOf(id);
+    if (at >= 0) S.order.splice(at, 1);
+    delete S.rowEls[id];
+    delete S.dirty[id];
+    rebuildList();
+    if (S.view === id) setView("compose", false);
+  }
 
-    // A live run owns the window: the setup cards step aside so the transfer,
-    // its numbers and its controls are the only thing in view.
-    var runOwnsWindow = live || finished;
-    els.sourceCard.hidden = runOwnsWindow;
-    els.readyCard.hidden = runOwnsWindow;
-    els.destCard.hidden = runOwnsWindow;
-    els.readyCard.classList.toggle("is-empty", !S.probe);
-    els.progressCard.hidden = !runOwnsWindow;
+  // ---------- sidebar ----------
 
-    els.urlInput.disabled = active;
-    els.probeBtn.disabled = active || st === "probing" || !els.urlInput.value.trim();
-    els.filenameInput.disabled = active;
-    els.connRange.disabled = active || S.stepperLocked;
-    els.chooseBtn.disabled = active;
+  function rebuildList() {
+    els.dlList.textContent = "";
+    S.rowEls = {};
+    for (var i = 0; i < S.order.length; i++) {
+      S.rowEls[S.order[i]] = buildRow(S.items[S.order[i]]);
+    }
+    S.order.forEach(function (id) { els.dlList.appendChild(S.rowEls[id].li); });
+    els.listEmpty.hidden = S.order.length > 0;
+  }
 
-    // transfer surface
-    els.barTrack.hidden = !(live || finished);
-    els.connSummaryRow.hidden = !(live || finished);
-    els.connGrid.hidden = S.liveConns <= 1;
-    els.stateNote.hidden = !S.note;
-    if (S.note) els.stateNote.textContent = S.note;
-    els.transferError.hidden = !failed;
-    els.donePanel.hidden = !finished;
+  function buildRow(item) {
+    var li = document.createElement("li");
+    li.className = "dl-item";
 
-    els.pauseBtn.hidden = !active;
-    els.cancelBtn.hidden = !active;
-    els.pauseBtn.textContent = st === "paused" ? "Resume" : "Pause";
-    els.pauseBtn.className = st === "paused" ? "btn btn-primary" : "btn btn-secondary";
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "dl-row";
+    btn.setAttribute("aria-label", item.filename + ", " + (STATE_LABEL[item.state] || item.state));
 
+    var top = document.createElement("span");
+    top.className = "dl-row-top";
+    var name = document.createElement("span");
+    name.className = "dl-row-name";
+    name.textContent = item.filename;
+    name.title = item.filename;
+    var pct = document.createElement("span");
+    pct.className = "dl-row-pct";
+    top.appendChild(name);
+    top.appendChild(pct);
+
+    var bar = document.createElement("span");
+    bar.className = "dl-row-bar";
+    var fill = document.createElement("span");
+    fill.className = "dl-row-fill";
+    bar.appendChild(fill);
+
+    var foot = document.createElement("span");
+    foot.className = "dl-row-foot";
+    var state = document.createElement("span");
+    state.className = "dl-row-state";
+    state.textContent = STATE_LABEL[item.state] || item.state;
+    foot.appendChild(state);
+
+    btn.appendChild(top);
+    btn.appendChild(bar);
+    btn.appendChild(foot);
+    btn.addEventListener("click", function () { setView(item.id); });
+
+    var x = document.createElement("button");
+    x.type = "button";
+    x.className = "dl-row-x";
+    x.addEventListener("click", function (e) {
+      e.stopPropagation();
+      closeItem(item.id);
+    });
+
+    li.appendChild(btn);
+    li.appendChild(x);
+    var row = { li: li, btn: btn, name: name, pct: pct, fill: fill, state: state, x: x };
+    paintRow(row, item);
+    return row;
+  }
+
+  // Mutate, never rebuild: progress ticks touch these rows at 4 Hz.
+  function paintRow(row, item) {
+    var p = pctOf(item.bytesDone, item.total);
+    row.btn.dataset.state = item.state;
+    row.btn.setAttribute("aria-current", S.view === item.id ? "true" : "false");
+    row.li.dataset.state = item.state;
+    if (row.state.textContent !== (STATE_LABEL[item.state] || item.state)) {
+      row.state.textContent = STATE_LABEL[item.state] || item.state;
+    }
+    if (item.state === "done") {
+      row.pct.textContent = "100%";
+      row.fill.style.width = "100%";
+    } else if (p == null) {
+      row.pct.textContent = item.total === null ? "" : "";
+      row.fill.style.width = "0%";
+    } else {
+      row.pct.textContent = Math.floor(p) + "%";
+      row.fill.style.width = p.toFixed(1) + "%";
+    }
+    if (item.state === "error") row.pct.textContent = p == null ? "" : Math.floor(p) + "%";
+    row.x.textContent = "\u00d7";
+    row.x.setAttribute(
+      "aria-label",
+      item.state === "downloading" || item.state === "paused"
+        ? "Cancel " + item.filename + " and delete its partial data"
+        : "Remove " + item.filename + " from the list"
+    );
+  }
+
+  function updateRow(id) {
+    var item = S.items[id];
+    var row = S.rowEls[id];
+    if (item && row) paintRow(row, item);
+  }
+
+  // ---------- view ----------
+
+  function setView(view, announce) {
+    S.view = view;
+    document.body.dataset.view = view === "compose" ? "compose" : "detail";
+    els.composeView.hidden = view !== "compose";
+    els.detailView.hidden = view === "compose";
+    els.newBtn.setAttribute("aria-current", view === "compose" ? "true" : "false");
+    for (var id in S.rowEls) {
+      S.rowEls[id].btn.setAttribute("aria-current", view === id ? "true" : "false");
+    }
+    if (view === "compose") {
+      S.gridKey = "";
+      renderCompose();
+    } else {
+      renderDetail(true);
+      if (announce) {
+        var row = S.rowEls[view];
+        if (row) row.btn.focus();
+      }
+    }
+    renderChrome();
+  }
+
+  function composeStateOf() {
+    return S.composeState;
+  }
+
+  function bodyState() {
+    return S.view === "compose" ? composeStateOf() : (selected() ? selected().state : "idle");
+  }
+
+  function renderChrome() {
+    var busy = 0;
+    var paused = 0;
+    for (var i = 0; i < S.order.length; i++) {
+      var st = S.items[S.order[i]].state;
+      if (st === "downloading") busy++;
+      else if (st === "paused") paused++;
+    }
+    document.body.dataset.state = bodyState();
+    document.body.dataset.busy = busy > 0 ? "true" : "false";
+
+    var label;
+    var tone;
+    if (busy > 0) {
+      label = busy === 1 ? "Downloading" : busy + " downloading";
+      tone = "live";
+    } else if (S.view === "compose" && S.composeState === "probing") {
+      label = "Probing";
+      tone = "busy";
+    } else if (paused > 0) {
+      label = paused === 1 ? "Paused" : paused + " paused";
+      tone = "warn";
+    } else if (S.view !== "compose" && selected()) {
+      var s = selected().state;
+      label = s === "done" ? "Complete" : s === "error" ? "Failed" : "Idle";
+      tone = s === "done" ? "ok" : s === "error" ? "error" : "idle";
+    } else {
+      label = "Idle";
+      tone = "idle";
+    }
+    els.statusText.textContent = label;
+    els.statusPill.dataset.tone = tone;
+
+    var active = activeCount();
+    els.sidebarCount.textContent = active === 0 ? "" : active + " active";
+    els.newBtn.disabled = active >= MAX_CONCURRENT;
+    els.newBtn.title = els.newBtn.disabled ? "Up to " + MAX_CONCURRENT + " downloads at once" : "";
+  }
+
+  // ---------- compose ----------
+
+  function renderCompose() {
+    var st = S.composeState;
+    var probed = !!S.probe;
+
+    els.readyCard.classList.toggle("is-empty", !probed);
+    els.urlInput.disabled = st === "probing";
+    els.probeBtn.disabled = st === "probing" || !els.urlInput.value.trim();
+    els.chooseBtn.disabled = st === "probing";
+    els.connRange.disabled = false;
+
+    els.urlMsg.classList.toggle("is-busy", st === "probing");
+    els.urlWrap.classList.toggle("is-invalid", !!S.composeError);
     els.urlMsg.hidden = st !== "probing" && !els.urlMsgText.textContent.trim();
 
-    // primary action
-    els.primaryBtn.hidden = active;
-    if (st === "done") {
-      els.primaryBtn.textContent = "Start another download";
-      els.primaryBtn.disabled = false;
-    } else if (failed) {
-      els.primaryBtn.textContent = "Try again";
-      els.primaryBtn.disabled = !S.probe;
-    } else {
-      els.primaryBtn.textContent = "Start download";
-      els.primaryBtn.disabled = !S.probe || !S.settings.destDir;
-    }
+    els.errorBanner.hidden = !S.composeError;
+    if (S.composeError) els.errorMsg.textContent = S.composeError;
 
-    renderActionHint();
-    renderDest();
-  }
+    els.destText.textContent = S.settings.destDir || "No folder chosen";
+    els.destText.classList.toggle("is-empty", !S.settings.destDir);
 
-  function renderActionHint() {
-    var st = S.state;
-    var text = "";
-    var tone = "";
-    if (st === "downloading") {
-      var n = S.liveConns || S.settings.connections;
-      text = "Streaming " + n + (n === 1 ? " connection" : " connections");
-    } else if (st === "paused") {
-      text = "Paused, offsets saved";
-    } else if (st === "error") {
-      text = "Download failed";
-      tone = "error";
-    } else if (st === "done") {
-      text = S.settings.destDir ? "Saved to " + middleEllipsis(S.settings.destDir, 34) : "Saved";
-    } else if (st === "ready" && !S.settings.destDir) {
-      text = "Choose a destination folder to continue";
-      tone = "warn";
-    } else if (st === "ready" && S.probe && !S.stepperLocked) {
-      var c = S.settings.connections;
-      text = c + (c === 1 ? " connection" : " connections");
-    }
-    els.actionHint.textContent = text;
-    els.actionHint.hidden = !text;
-    if (tone) els.actionHint.dataset.tone = tone;
-    else els.actionHint.removeAttribute("data-tone");
-  }
-
-  function renderDest() {
-    if (S.settings.destDir) {
-      els.destText.textContent = S.settings.destDir;
-      els.destText.classList.remove("is-empty");
-    } else {
-      els.destText.textContent = "No folder chosen";
-      els.destText.classList.add("is-empty");
-    }
+    renderFooter();
   }
 
   function renderStepper() {
     var n = S.settings.connections;
     els.connRange.value = String(n);
     els.connValue.textContent = String(n);
-    els.connRange.style.setProperty("--fill", ((n - MIN_CONNECTIONS) / (MAX_CONNECTIONS - MIN_CONNECTIONS) * 100) + "%");
+    els.connRange.style.setProperty(
+      "--fill",
+      ((n - MIN_CONNECTIONS) / (MAX_CONNECTIONS - MIN_CONNECTIONS) * 100) + "%"
+    );
     els.connRange.setAttribute("aria-valuetext", n + (n === 1 ? " connection" : " connections"));
-  }
-
-  function renderUrlMsg() {
-    var st = S.state;
-    els.urlMsg.classList.toggle("is-busy", st === "probing");
-    els.urlWrap.classList.toggle("is-invalid", !!(S.urlError && st !== "probing"));
-  }
-
-  // ---------- errors ----------
-
-  function showUrlError(message) {
-    S.urlError = true;
-    els.errorMsg.textContent = message;
-    els.errorBanner.hidden = false;
-    renderUrlMsg();
-    els.urlWrap.classList.add("is-invalid");
-  }
-
-  function clearUrlError() {
-    S.urlError = false;
-    els.errorBanner.hidden = true;
-    els.errorMsg.textContent = "";
-    els.urlWrap.classList.remove("is-invalid");
-  }
-
-  // ---------- probing ----------
-
-  function maybeProbe() {
-    if (S.starting) return;
-    if (S.state === "probing" || S.state === "downloading" || S.state === "paused") return;
-    var url = els.urlInput.value.trim();
-    if (!url) return;
-    doProbe(url);
-  }
-
-  async function doProbe(url) {
-    var seq = ++S.probeSeq;
-    S.starting = false;
-    S.dlId = null;
-    clearUrlError();
-    setState("probing");
-    els.urlMsgText.textContent = "Checking the origin\u2026";
-    try {
-      var info = await invoke("probe_url", { url: url });
-      // The field may have been edited (or cleared) while this was in flight.
-      if (seq !== S.probeSeq || els.urlInput.value.trim() !== url) return;
-      if (!info || typeof info !== "object") throw new Error("empty probe response");
-      S.probe = info;
-      S.metaSeq++;
-      populateDetails(info);
-      els.urlMsgText.textContent = "";
-      setState("ready");
-      if (S.settings.destDir) metaCheck();
-    } catch (err) {
-      if (seq !== S.probeSeq) return;
-      S.probe = null;
-      els.urlMsgText.textContent = "";
-      setState("idle");
-      showUrlError(errText(err));
-    }
   }
 
   function populateDetails(info) {
     els.filenameInput.value = info.filename || "";
     els.filenameInput.title = info.filename || "";
-
     els.metaSize.textContent = info.size == null ? "Unknown" : formatBytes(info.size);
     els.metaSize.style.color = info.size == null ? "var(--muted)" : "";
-
-    var multi = !!info.acceptsRanges && info.size != null;
     els.metaRanges.textContent = info.acceptsRanges ? "Supported" : "Not supported";
     els.metaRanges.className = "badge " + (info.acceptsRanges ? "badge-yes" : "badge-no");
-
-    var method = info.probeMethod === "range" ? "Range GET" : "HEAD";
-    if (info.acceptsRanges && info.probeMethod === "head") method = "HEAD";
-    els.metaProbe.textContent = method;
-
+    els.metaProbe.textContent = info.probeMethod === "range" ? "Range GET" : "HEAD";
     els.metaServer.textContent = info.server || "Not advertised";
     els.metaServer.title = info.server || "";
-
     if (info.contentType) {
       els.typeChip.textContent = info.contentType;
       els.typeChip.title = info.contentType;
@@ -377,20 +435,60 @@
     } else {
       els.typeChip.hidden = true;
     }
-
-    els.resumeNote.hidden = true;
-
-    S.stepperLocked = !multi;
+    var multi = !!info.acceptsRanges && info.size != null;
     els.connNote.hidden = multi;
     els.connNote.textContent = multi
       ? ""
-      : (info.size == null ? "Unknown file size, so one connection" : "This server ignores range requests, so one connection");
+      : info.size == null
+        ? "Unknown file size, so one connection"
+        : "This server ignores range requests, so one connection";
+    els.resumeNote.hidden = true;
   }
 
-  // ---------- resume detection ----------
+  function currentFilename() {
+    var v = els.filenameInput.value.trim();
+    return v || (S.probe ? S.probe.filename : "");
+  }
+
+  function maybeProbe() {
+    if (S.composeState === "probing") return;
+    var url = els.urlInput.value.trim();
+    if (!url) return;
+    doProbe(url);
+  }
+
+  async function doProbe(url) {
+    var seq = ++S.probeSeq;
+    S.composeError = "";
+    S.composeState = "probing";
+    els.urlMsgText.textContent = "Checking the origin\u2026";
+    renderCompose();
+    renderChrome();
+    try {
+      var info = await invoke("probe_url", { url: url });
+      if (seq !== S.probeSeq || els.urlInput.value.trim() !== url) return;
+      if (!info || typeof info !== "object") throw new Error("empty probe response");
+      S.probe = info;
+      S.metaSeq++;
+      populateDetails(info);
+      els.urlMsgText.textContent = "";
+      S.composeState = "ready";
+      renderCompose();
+      renderChrome();
+      if (S.settings.destDir) metaCheck();
+    } catch (err) {
+      if (seq !== S.probeSeq) return;
+      S.probe = null;
+      els.urlMsgText.textContent = "";
+      S.composeState = "idle";
+      S.composeError = errText(err);
+      renderCompose();
+      renderChrome();
+    }
+  }
 
   async function metaCheck() {
-    if (!S.probe || !S.settings.destDir || S.state !== "ready") {
+    if (!S.probe || !S.settings.destDir || S.composeState !== "ready") {
       els.resumeNote.hidden = true;
       return;
     }
@@ -402,52 +500,29 @@
         filename: currentFilename(),
         size: S.probe.size
       });
-      if (seq !== S.metaSeq || S.state !== "ready") return;
-      var p = pct(res && res.bytesDone, S.probe.size);
+      if (seq !== S.metaSeq || S.composeState !== "ready") return;
+      var p = pctOf(res && res.bytesDone, S.probe.size);
       var show = !!(res && res.compatible && res.bytesDone > 0 && p != null && p > 0);
       els.resumeNote.hidden = !show;
       if (show) {
-        els.resumeText.textContent = "Partial file found: " + formatBytes(res.bytesDone) +
-          " of " + formatBytes(S.probe.size) + " done. Start will resume it.";
+        els.resumeText.textContent =
+          "Partial file found: " + formatBytes(res.bytesDone) + " of " +
+          formatBytes(S.probe.size) + " done. Start will resume it.";
       }
     } catch (err) {
       if (seq === S.metaSeq) els.resumeNote.hidden = true;
     }
   }
 
-  // ---------- transfer surface ----------
-
-  function resetTransferSurface() {
-    els.barFill.style.width = "0%";
-    els.barTrack.classList.remove("is-indeterminate");
-    els.barTrack.setAttribute("aria-valuenow", "0");
-    els.barTrack.setAttribute("aria-valuetext", "");
-    els.progressPct.textContent = "0%";
-    els.statSpeed.textContent = "0.0 MiB/s";
-    els.statBytes.textContent = S.probe && S.probe.size != null
-      ? "0 B / " + formatBytes(S.probe.size)
-      : "0 B";
-    els.statEta.textContent = "calculating\u2026";
-    els.connSummary.textContent = "0/" + S.settings.connections + " complete";
-    S.note = "";
-    els.stateNote.hidden = true;
-    els.stateNote.classList.remove("is-error");
-    els.stateNote.textContent = "";
-    els.transferError.hidden = true;
-    els.transferErrorMsg.textContent = "";
-    els.donePath.textContent = "";
-    els.donePath.classList.remove("is-error");
-    els.connGrid.textContent = "";
-    els.connGrid.removeAttribute("data-count");
-    S.cells = [];
-    S.gridFor = -1;
-    S.ariaPct = -1;
-    S.liveConns = S.settings.connections; // optimistic until the first event
-    els.connGrid.hidden = S.liveConns <= 1;
-  }
+  // ---------- starting a download ----------
 
   async function startDownload() {
     if (!S.probe || S.starting || !S.settings.destDir) return;
+    if (activeCount() >= MAX_CONCURRENT) {
+      S.composeError = "too many downloads in progress";
+      renderCompose();
+      return;
+    }
     var args = {
       url: S.probe.url,
       destDir: S.settings.destDir,
@@ -457,209 +532,152 @@
       acceptsRanges: S.probe.acceptsRanges
     };
     S.starting = true;
-    S.lastProgress = null;
-    S.finalPath = null;
-    resetTransferSurface();
-    els.dlName.textContent = args.filename;
-    els.dlName.title = args.filename;
-    clearUrlError();
+    S.composeError = "";
+    renderCompose();
+    els.primaryBtn.disabled = true;
     try {
       var res = await invoke("start_download", args);
-      // A terminal event may have already settled this run while the ack was in
-      // flight; resurrecting it as "downloading" would strand a dead transfer.
       if (!S.starting) return;
       S.starting = false;
-      if (res && res.id) S.dlId = res.id;
-      setState("downloading");
+      if (!res || !res.id) throw new Error("engine did not return an id");
+      addItem({
+        id: res.id,
+        url: args.url,
+        filename: args.filename,
+        destDir: args.destDir,
+        connections: args.connections,
+        size: args.size,
+        state: "downloading",
+        bytesDone: 0,
+        total: args.size,
+        speedBps: 0,
+        etaSecs: null,
+        conns: [],
+        note: "",
+        error: "",
+        path: null,
+        doneSize: null
+      });
+      setView(res.id);
+      resetCompose();
     } catch (err) {
       S.starting = false;
-      showTransferError(errText(err));
+      S.composeError = errText(err);
+      renderCompose();
     }
   }
 
-  function showTransferError(message) {
-    els.transferErrorMsg.textContent = message;
-    setState("error");
-    // keep the last measured frame on screen: where it failed is information.
-    // Applied after the state flips so the dead run reports no live speed/ETA.
-    if (S.lastProgress) {
-      try { applyProgress(S.lastProgress); } catch (e) { /* never mask the real error */ }
+  function resetCompose() {
+    S.probe = null;
+    S.probeSeq++;
+    S.composeState = "idle";
+    S.composeError = "";
+    els.urlInput.value = "";
+    els.urlMsgText.textContent = "Paste a URL and press Enter to check the origin.";
+    els.resumeNote.hidden = true;
+    els.readyCard.classList.add("is-empty");
+    renderCompose();
+    renderChrome();
+  }
+
+  // ---------- detail ----------
+
+  function renderDetail(forceGrid) {
+    var item = selected();
+    if (!item) return;
+    els.dlName.textContent = item.filename;
+    els.dlName.title = item.filename;
+    els.dlSub.textContent =
+      (item.state === "done" ? formatBytes(item.doneSize || item.total) + " \u00b7 " : "") +
+      item.destDir;
+    els.dlSub.title = item.destDir;
+
+    var live = item.state === "downloading" || item.state === "paused" || item.state === "error";
+    var finished = item.state === "done";
+
+    els.barTrack.hidden = !(live || finished);
+    els.connSummaryRow.hidden = !live;
+    if (finished) els.connGrid.hidden = true;
+    els.stateNote.hidden = !item.note;
+    if (item.note) els.stateNote.textContent = item.note;
+    els.transferError.hidden = item.state !== "error";
+    if (item.state === "error") els.transferErrorMsg.textContent = item.error || "download failed";
+    els.donePanel.hidden = !finished;
+    if (finished) {
+      els.doneTitle.textContent = item.doneSize != null
+        ? "Download complete \u00b7 " + formatBytes(item.doneSize)
+        : "Download complete";
+      els.donePath.textContent = item.path ? middleEllipsis(item.path, 54) : "";
+      els.donePath.title = item.path || "";
+      els.donePath.classList.remove("is-error");
     }
+
+    applyNumbers(item);
+    if (forceGrid) S.gridKey = "";
+    applyConns(item);
+    renderFooter();
   }
 
-  // ---------- events ----------
+  function applyNumbers(item) {
+    var known = item.total != null && item.total > 0;
+    var overall = known ? pctOf(item.bytesDone, item.total) : null;
+    els.barTrack.classList.toggle("is-indeterminate", !known && item.state === "downloading");
 
-  function onState(p) {
-    if (!p) return;
-    // Late events from a run that is already over are noise (#13).
-    if (p.id != null && S.deadIds[p.id]) return;
-    if (S.starting && p.state === "downloading" && S.dlId == null) {
-      S.dlId = p.id;
-      S.starting = false;
-    }
-    // Any terminal state ends the start handshake, whatever the ack says.
-    if (p.state === "done" || p.state === "error") S.starting = false;
-    if (p.id != null && S.dlId != null && p.id !== S.dlId) return;
-
-    switch (p.state) {
-      case "downloading":
-        clearUrlError();
-        ensureTitle();
-        setState("downloading");
-        showNote(p.note || "");
-        if (S.lastProgress) applyProgress(S.lastProgress);
-        break;
-      case "paused":
-        setState("paused");
-        showNote("Paused, offsets saved");
-        if (S.lastProgress) applyProgress(S.lastProgress);
-        break;
-      case "done":
-        ensureTitle();
-        showNote("");
-        if (S.lastProgress) {
-          try { applyProgress(S.lastProgress); } catch (e) { /* the panel below is the truth */ }
-        }
-        els.barFill.style.width = "100%";
-        els.barTrack.classList.remove("is-indeterminate");
-        els.progressPct.textContent = "100%";
-        els.barTrack.setAttribute("aria-valuenow", "100");
-        els.barTrack.setAttribute("aria-valuetext", "100 percent, download complete");
-        S.finalPath = typeof p.path === "string" ? p.path : null;
-        els.donePath.textContent = S.finalPath ? middleEllipsis(S.finalPath, 58) : "";
-        els.donePath.title = S.finalPath || "";
-        els.doneTitle.textContent = p.size != null
-          ? "Download complete \u00b7 " + formatBytes(p.size)
-          : "Download complete";
-        setState("done");
-        break;
-      case "error":
-        showNote("");
-        showTransferError(p.message || "download failed");
-        break;
-    }
-  }
-
-  function ensureTitle() {
-    var t = els.dlName.textContent.trim();
-    if (!t) {
-      els.dlName.textContent = currentFilename() || "download";
-      els.dlName.title = els.dlName.textContent;
-    }
-  }
-
-  function showNote(text) {
-    S.note = text || "";
-    els.stateNote.textContent = S.note;
-    els.stateNote.hidden = !S.note;
-  }
-
-  function onProgress(p) {
-    if (!p) return;
-    if (p.id != null && S.dlId != null && p.id !== S.dlId) return;
-    if (S.state !== "downloading" && S.state !== "paused" && S.state !== "error" && !S.starting) return;
-    S.lastProgress = p;
-    if (!S.rafPending) {
-      S.rafPending = true;
-      requestAnimationFrame(flushProgress);
-    }
-  }
-
-  // Coalesce the >= 4 Hz stream into at most one DOM pass per frame.
-  function flushProgress() {
-    S.rafPending = false;
-    if (!S.lastProgress) return;
-    if (S.state !== "downloading" && S.state !== "paused" && S.state !== "error" && !S.starting) return;
-    applyProgress(S.lastProgress);
-  }
-
-  function applyProgress(p) {
-    var known = p.total != null && p.total > 0;
-    var overall = known ? pct(p.bytesDone, p.total) : null;
-
-    els.barTrack.classList.toggle("is-indeterminate", !known);
-    if (known) {
-      els.barFill.style.width = (overall == null ? 0 : overall).toFixed(2) + "%";
+    if (item.state === "done") {
+      els.barFill.style.width = "100%";
+      els.progressPct.textContent = "100%";
+      els.barTrack.setAttribute("aria-valuenow", "100");
+      els.barTrack.setAttribute("aria-valuetext", "100 percent, download complete");
     } else {
-      els.barFill.style.width = "";
+      if (known) els.barFill.style.width = (overall == null ? 0 : overall).toFixed(2) + "%";
+      else els.barFill.style.width = "";
+
+      var whole = known && overall != null ? Math.floor(overall) : 0;
+      if (whole !== S.ariaPct) {
+        S.ariaPct = whole;
+        els.barTrack.setAttribute("aria-valuenow", String(whole));
+        els.barTrack.setAttribute(
+          "aria-valuetext",
+          known
+            ? formatBytes(item.bytesDone) + " of " + formatBytes(item.total) + ", " + whole + " percent"
+            : formatBytes(item.bytesDone) + " downloaded"
+        );
+      }
+      els.progressPct.textContent = known && overall != null
+        ? (overall >= 100 ? "100" : overall.toFixed(1)) + "%"
+        : formatBytes(item.bytesDone);
     }
 
-    // the accessible value only changes when the whole percent does
-    var whole = known && overall != null ? Math.floor(overall) : 0;
-    if (whole !== S.ariaPct) {
-      S.ariaPct = whole;
-      els.barTrack.setAttribute("aria-valuenow", String(whole));
-      els.barTrack.setAttribute("aria-valuetext", known
-        ? formatBytes(p.bytesDone) + " of " + formatBytes(p.total) + ", " + whole + " percent"
-        : formatBytes(p.bytesDone) + " downloaded");
-    }
-
-    if (known && overall != null) {
-      els.progressPct.textContent = (overall >= 100 ? 100 : overall).toFixed(1) + "%";
-    } else {
-      els.progressPct.textContent = formatBytes(p.bytesDone);
-    }
-
-    var stalled = S.state === "paused" || S.state === "error";
-    els.statSpeed.textContent = stalled ? "\u2014" : formatSpeed(p.speedBps);
+    var stalled = item.state === "paused" || item.state === "error" || item.state === "done";
+    els.statSpeed.textContent = stalled ? "\u2014" : formatSpeed(item.speedBps);
     els.statBytes.textContent = known
-      ? formatBytes(p.bytesDone) + " / " + formatBytes(p.total)
-      : formatBytes(p.bytesDone);
-    els.statEta.textContent = stalled ? "\u2014" : formatEta(p.etaSecs);
-
-    applyConns(p);
+      ? formatBytes(item.bytesDone) + " / " + formatBytes(item.total)
+      : formatBytes(item.bytesDone);
+    els.statEta.textContent = stalled ? "\u2014" : formatEta(item.etaSecs);
   }
 
-  // ---------- the comb (built once per download, mutated per tick) ----------
-
-  function buildConnGrid(n) {
-    els.connGrid.textContent = "";
-    S.cells = [];
-    S.gridFor = n;
-    els.connGrid.dataset.count = String(n);
-    for (var i = 0; i < n; i++) {
-      var root = document.createElement("div");
-      root.className = "conn-cell";
-      root.dataset.phase = "idle";
-
-      var num = document.createElement("span");
-      num.className = "conn-num";
-      num.textContent = String(i + 1);
-
-      var track = document.createElement("div");
-      track.className = "conn-track";
-      var fill = document.createElement("div");
-      fill.className = "conn-fill";
-      fill.style.height = "0%";
-      track.appendChild(fill);
-
-      var pctEl = document.createElement("span");
-      pctEl.className = "conn-pct";
-      pctEl.textContent = "0%";
-
-      root.appendChild(num);
-      root.appendChild(track);
-      root.appendChild(pctEl);
-      els.connGrid.appendChild(root);
-      S.cells.push({ root: root, fill: fill, pct: pctEl, label: "0%" });
-    }
-  }
-
-  function applyConns(p) {
-    if (!Array.isArray(p.conns) || p.conns.length === 0) return;
-    if (p.conns.length !== S.gridFor) buildConnGrid(p.conns.length);
-
-    S.liveConns = p.conns.length;
+  function applyConns(item) {
+    var conns = item.conns || [];
+    S.liveConns = conns.length || item.connections;
     els.connGrid.hidden = S.liveConns <= 1;
+    var key = item.id + ":" + conns.length;
+    if (conns.length > 0 && (S.gridKey !== key || (S.cells.length !== conns.length))) {
+      buildConnGrid(conns.length);
+      S.gridKey = key;
+    }
+    if (conns.length === 0) {
+      els.connSummary.textContent = "0/" + item.connections + " complete";
+      return;
+    }
     var doneCount = 0;
-    for (var i = 0; i < p.conns.length && i < S.cells.length; i++) {
-      var c = p.conns[i];
+    for (var i = 0; i < conns.length; i++) {
+      var c = conns[i];
       var cell = S.cells[i];
+      if (!cell) break;
       var phase = c.phase || "idle";
       if (phase === "done") doneCount++;
       if (cell.root.dataset.phase !== phase) cell.root.dataset.phase = phase;
-
-      var cp = pct(c.done, c.size);
+      var cp = pctOf(c.done, c.size);
       if (cp == null) {
         if (cell.fill.style.height !== "") cell.fill.style.height = "";
         if (cell.label !== "") { cell.pct.textContent = ""; cell.label = ""; }
@@ -672,41 +690,335 @@
     }
     els.connSummary.textContent = S.liveConns === 1
       ? (doneCount === 1 ? "single stream, complete" : "single stream")
-      : doneCount + "/" + p.conns.length + " complete";
+      : doneCount + "/" + conns.length + " complete";
+  }
+
+  function buildConnGrid(n) {
+    els.connGrid.textContent = "";
+    S.cells = [];
+    els.connGrid.dataset.count = String(n);
+    for (var i = 0; i < n; i++) {
+      var root = document.createElement("div");
+      root.className = "conn-cell";
+      root.dataset.phase = "idle";
+      var num = document.createElement("span");
+      num.className = "conn-num";
+      num.textContent = String(i + 1);
+      var track = document.createElement("div");
+      track.className = "conn-track";
+      var fill = document.createElement("div");
+      fill.className = "conn-fill";
+      fill.style.height = "0%";
+      track.appendChild(fill);
+      var pctEl = document.createElement("span");
+      pctEl.className = "conn-pct";
+      pctEl.textContent = "0%";
+      root.appendChild(num);
+      root.appendChild(track);
+      root.appendChild(pctEl);
+      els.connGrid.appendChild(root);
+      S.cells.push({ root: root, fill: fill, pct: pctEl, label: "0%" });
+    }
+  }
+
+  // ---------- footer ----------
+
+  function show(el, on) { el.hidden = !on; }
+
+  function renderFooter() {
+    var hint = "";
+    var tone = "";
+    var item = selected();
+
+    if (S.view === "compose") {
+      show(els.cancelBtn, false);
+      show(els.pauseBtn, false);
+      show(els.removeBtn, false);
+      show(els.revealBtn, false);
+      show(els.primaryBtn, true);
+      els.primaryBtn.textContent = "Start download";
+      els.primaryBtn.disabled = !S.probe || !S.settings.destDir || S.starting || S.composeState === "probing";
+      if (S.composeState === "probing") {
+        hint = "";
+      } else if (S.probe && !S.settings.destDir) {
+        hint = "Choose a destination folder to continue";
+        tone = "warn";
+      } else if (S.probe) {
+        var n = S.settings.connections;
+        hint = n + (n === 1 ? " connection" : " connections");
+      }
+    } else if (item) {
+      show(els.primaryBtn, item.state === "error");
+      show(els.removeBtn, item.state === "done" || item.state === "error");
+      show(els.revealBtn, item.state === "done");
+      show(els.cancelBtn, item.state === "downloading" || item.state === "paused");
+      show(els.pauseBtn, item.state === "downloading" || item.state === "paused");
+
+      if (item.state === "downloading") {
+        hint = "Streaming " + (item.conns.length || item.connections) +
+          ((item.conns.length || item.connections) === 1 ? " connection" : " connections");
+      } else if (item.state === "paused") {
+        hint = "Paused, offsets saved";
+        tone = "warn";
+      } else if (item.state === "done") {
+        hint = item.destDir ? "Saved to " + middleEllipsis(item.destDir, 34) : "Saved";
+      } else if (item.state === "error") {
+        hint = "Download failed";
+        tone = "error";
+      }
+
+      els.pauseBtn.textContent = item.state === "paused" ? "Resume" : "Pause";
+      els.pauseBtn.className = item.state === "paused" ? "btn btn-primary" : "btn btn-secondary";
+      els.primaryBtn.textContent = "Try again";
+      els.primaryBtn.disabled = false;
+    }
+
+    els.actionHint.textContent = hint;
+    els.actionHint.hidden = !hint;
+    if (tone) els.actionHint.dataset.tone = tone;
+    else els.actionHint.removeAttribute("data-tone");
+  }
+
+  // ---------- events ----------
+
+  function onState(p) {
+    if (!p) return;
+    if (p.id != null && S.deadIds[p.id]) return;
+
+    var item = p.id != null ? S.items[p.id] : null;
+    if (!item && S.starting && p.state === "downloading") {
+      // The engine announced the run before the start ack landed: adopt it.
+      S.starting = false;
+      addItem({
+        id: p.id,
+        url: "",
+        filename: currentFilename() || "download",
+        destDir: S.settings.destDir || "",
+        connections: S.settings.connections,
+        size: null,
+        state: "downloading",
+        bytesDone: 0,
+        total: null,
+        speedBps: 0,
+        etaSecs: null,
+        conns: [],
+        note: "",
+        error: "",
+        path: null,
+        doneSize: null
+      });
+      setView(p.id);
+      resetCompose();
+      item = S.items[p.id];
+    }
+    if (!item) return;
+
+    if (p.state === "downloading") item.note = p.note || "";
+    if (p.state === "paused") item.note = "Paused, offsets saved";
+    if (p.state === "done") {
+      item.note = "";
+      item.state = "done";
+      item.path = typeof p.path === "string" ? p.path : null;
+      item.doneSize = p.size != null ? p.size : item.total;
+      item.speedBps = 0;
+      item.etaSecs = null;
+      if (item.total != null) item.bytesDone = item.total;
+    } else if (p.state === "error") {
+      item.note = "";
+      item.state = "error";
+      item.error = p.message || "download failed";
+      item.speedBps = 0;
+    } else {
+      item.state = p.state;
+    }
+
+    S.dirty[item.id] = true;
+    scheduleFlush();
+    if (S.view === item.id) renderDetail(true);
+    renderChrome();
+  }
+
+  function onProgress(p) {
+    if (!p) return;
+    if (p.id != null && S.deadIds[p.id]) return;
+    var item = S.items[p.id];
+    if (!item) return;
+    item.bytesDone = p.bytesDone || 0;
+    item.total = p.total != null ? p.total : item.total;
+    item.speedBps = p.speedBps || 0;
+    item.etaSecs = p.etaSecs != null ? p.etaSecs : null;
+    item.conns = Array.isArray(p.conns) ? p.conns : [];
+    S.dirty[item.id] = true;
+    scheduleFlush();
+  }
+
+  function scheduleFlush() {
+    if (S.rafPending) return;
+    S.rafPending = true;
+    requestAnimationFrame(flush);
+  }
+
+  function flush() {
+    S.rafPending = false;
+    var ids = Object.keys(S.dirty);
+    S.dirty = {};
+    for (var i = 0; i < ids.length; i++) {
+      updateRow(ids[i]);
+      if (S.view === ids[i]) {
+        var item = S.items[ids[i]];
+        if (item) {
+          applyNumbers(item);
+          applyConns(item);
+        }
+      }
+    }
+  }
+
+  // ---------- actions ----------
+
+  async function closeItem(id) {
+    var item = S.items[id];
+    if (!item) return;
+    if (item.state === "downloading" || item.state === "paused") {
+      await cancelItem(item);
+    } else {
+      dropItem(id);
+    }
+  }
+
+  async function cancelItem(item) {
+    if (S.controlPending) return;
+    S.controlPending = true;
+    S.deadIds[item.id] = 1;
+    try {
+      await invoke("cancel_download", { id: item.id });
+      dropItem(item.id);
+    } catch (err) {
+      // The engine answers "the download had already finished" when the run
+      // settled while we were asking. That is not a failure of the run, so a
+      // completed item stays completed; anything else surfaces the verbatim
+      // reason. Late events are re-admitted either way, so a dropped terminal
+      // event can still land.
+      S.deadIds[item.id] = 0;
+      if (item.state !== "done") {
+        item.state = "error";
+        item.error = errText(err);
+        S.dirty[item.id] = true;
+        scheduleFlush();
+        if (S.view === item.id) renderDetail(true);
+      }
+      renderChrome();
+    } finally {
+      S.controlPending = false;
+    }
+  }
+
+  async function togglePause(item) {
+    if (S.controlPending) return;
+    if (item.state !== "downloading" && item.state !== "paused") return;
+    S.controlPending = true;
+    els.pauseBtn.disabled = true;
+    try {
+      if (item.state === "paused") await invoke("resume_download", { id: item.id });
+      else await invoke("pause_download", { id: item.id });
+    } catch (err) {
+      item.state = "error";
+      item.error = errText(err);
+      if (S.view === item.id) renderDetail(true);
+      renderChrome();
+    } finally {
+      S.controlPending = false;
+      els.pauseBtn.disabled = false;
+    }
+  }
+
+  async function retry(item) {
+    if (S.starting) return;
+    if (activeCount() >= MAX_CONCURRENT) {
+      item.error = "too many downloads in progress";
+      renderDetail(true);
+      return;
+    }
+    var args = {
+      url: item.url,
+      destDir: item.destDir,
+      filename: item.filename,
+      connections: item.connections,
+      size: item.size,
+      acceptsRanges: true
+    };
+    S.starting = true;
+    try {
+      var res = await invoke("start_download", args);
+      S.starting = false;
+      if (!res || !res.id) throw new Error("engine did not return an id");
+      dropItem(item.id);
+      addItem({
+        id: res.id,
+        url: item.url,
+        filename: item.filename,
+        destDir: item.destDir,
+        connections: item.connections,
+        size: item.size,
+        state: "downloading",
+        bytesDone: 0,
+        total: item.size,
+        speedBps: 0,
+        etaSecs: null,
+        conns: [],
+        note: "",
+        error: "",
+        path: null,
+        doneSize: null
+      });
+      setView(res.id);
+    } catch (err) {
+      S.starting = false;
+      item.state = "error";
+      item.error = errText(err);
+      renderDetail(true);
+    }
+    renderChrome();
   }
 
   // ---------- wiring ----------
 
-  els.urlInput.addEventListener("paste", function () {
-    setTimeout(maybeProbe, 0);
+  els.newBtn.addEventListener("click", function () {
+    setView("compose");
+    resetCompose();
+    els.urlInput.focus();
   });
+
+  els.urlInput.addEventListener("paste", function () { setTimeout(maybeProbe, 0); });
   els.urlInput.addEventListener("keydown", function (e) {
     if (e.key === "Enter") { e.preventDefault(); maybeProbe(); }
   });
   els.urlInput.addEventListener("input", function () {
-    S.probeSeq++; // invalidate any probe already in flight
-    clearUrlError();
+    S.probeSeq++;
+    S.composeError = "";
     if (S.probe) {
       S.probe = null;
+      S.composeState = "idle";
       els.resumeNote.hidden = true;
-      if (S.state !== "probing") setState("idle");
+      els.readyCard.classList.add("is-empty");
     }
-    els.probeBtn.disabled = !els.urlInput.value.trim();
+    renderCompose();
+    renderChrome();
   });
   els.probeBtn.addEventListener("click", function () { maybeProbe(); });
 
   var metaTimer = 0;
   els.filenameInput.addEventListener("input", function () {
-    if (S.state !== "ready") return;
+    if (S.composeState !== "ready") return;
     clearTimeout(metaTimer);
     metaTimer = setTimeout(function () {
-      if (S.state === "ready" && S.settings.destDir) metaCheck();
+      if (S.composeState === "ready" && S.settings.destDir) metaCheck();
     }, 350);
   });
   els.filenameInput.addEventListener("keydown", function (e) {
     if (e.key === "Enter") {
       e.preventDefault();
-      if (S.state === "ready" && !els.primaryBtn.disabled) els.primaryBtn.click();
+      if (!els.primaryBtn.disabled) startDownload();
     }
   });
 
@@ -715,11 +1027,12 @@
       var dir = await invoke("pick_folder", {});
       if (dir == null) return;
       S.settings.destDir = dir;
-      render();
+      renderCompose();
       invoke("save_settings", { destDir: dir }).catch(function () {});
       metaCheck();
     } catch (err) {
-      showUrlError(errText(err));
+      S.composeError = errText(err);
+      renderCompose();
     }
   });
 
@@ -727,96 +1040,57 @@
     var n = clampConnections(els.connRange.value);
     S.settings.connections = n;
     renderStepper();
-    renderActionHint();
+    renderCompose();
     invoke("save_settings", { connections: n }).catch(function () {});
   });
 
   els.primaryBtn.addEventListener("click", function () {
-    if (S.state === "done") {
-      S.probe = null;
-      if (S.dlId != null) S.deadIds[S.dlId] = 1;
-      S.dlId = null;
-      S.lastProgress = null;
-      S.finalPath = null;
-      els.resumeNote.hidden = true;
-      resetTransferSurface();
-      setState("idle");
-      els.urlInput.focus();
-      els.urlInput.select();
+    var item = selected();
+    if (S.view !== "compose" && item && item.state === "error") {
+      retry(item);
       return;
     }
-    if (S.state === "error") {
-      if (S.dlId != null) S.deadIds[S.dlId] = 1;
-      S.dlId = null;
-      S.starting = false;
-      S.lastProgress = null;
-      els.transferError.hidden = true;
-      setState("ready");
-      if (S.settings.destDir) metaCheck();
+    if (S.view !== "compose") return;
+    if (!S.settings.destDir) {
+      S.composeError = "";
+      els.chooseBtn.focus();
+      els.actionHint.textContent = "Choose a destination folder to continue";
+      els.actionHint.hidden = false;
+      els.actionHint.dataset.tone = "warn";
       return;
     }
-    if (S.state === "ready" && S.probe) {
-      if (!S.settings.destDir) {
-        els.actionHint.textContent = "Choose a destination folder to continue";
-        els.actionHint.hidden = false;
-        els.actionHint.dataset.tone = "warn";
-        els.chooseBtn.focus();
-        return;
-      }
-      startDownload();
-    }
+    startDownload();
   });
 
-  async function togglePause() {
-    if (S.controlPending) return;
-    if (S.state !== "downloading" && S.state !== "paused") return;
-    var resuming = S.state === "paused";
-    S.controlPending = true;
-    // Optimistic: the 4 Hz progress stream must not race this await.
-    setState(resuming ? "downloading" : "paused");
-    try {
-      if (resuming) await invoke("resume_download", { id: S.dlId });
-      else await invoke("pause_download", { id: S.dlId });
-    } catch (err) {
-      setState(resuming ? "paused" : "downloading");
-      showTransferError(errText(err));
-    } finally {
-      S.controlPending = false;
-    }
-  }
+  els.cancelBtn.addEventListener("click", function () {
+    var item = selected();
+    if (item) cancelItem(item);
+  });
 
-  els.pauseBtn.addEventListener("click", togglePause);
+  els.pauseBtn.addEventListener("click", function () {
+    var item = selected();
+    if (item) togglePause(item);
+  });
 
-  els.cancelBtn.addEventListener("click", async function () {
-    if ((S.state !== "downloading" && S.state !== "paused") || !S.dlId) return;
-    els.cancelBtn.disabled = true;
-    try {
-      await invoke("cancel_download", { id: S.dlId });
-    } catch (err) {
-      els.cancelBtn.disabled = false;
-      showTransferError(errText(err));
-      return;
-    }
-    els.cancelBtn.disabled = false;
-    // cancel leaves the probe valid, so return straight to ready. The bridge
-    // only replied after the files were deleted, so a resume check here is honest.
-    if (S.dlId != null) S.deadIds[S.dlId] = 1;
-    S.dlId = null;
-    S.starting = false;
-    S.lastProgress = null;
-    resetTransferSurface();
-    setState("ready");
-    metaCheck();
+  els.removeBtn.addEventListener("click", function () {
+    var item = selected();
+    if (item) dropItem(item.id);
   });
 
   els.revealBtn.addEventListener("click", async function () {
-    if (!S.finalPath) return;
+    var item = selected();
+    if (!item || !item.path) return;
     try {
-      await invoke("reveal_path", { path: S.finalPath });
+      await invoke("reveal_path", { path: item.path });
     } catch (err) {
       els.donePath.textContent = errText(err);
       els.donePath.classList.add("is-error");
     }
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") return;
+    if (S.view !== "compose") setView("compose");
   });
 
   // ---------- boot ----------
@@ -824,16 +1098,18 @@
   async function init() {
     var backend = false;
     try {
-      // Keep the unlisten handles: dropping them leaks a webview listener per
-      // init, which only matters if init is ever re-run without a reload.
-      S.unlisten.push(await window.__TAURI__.event.listen("hydra://state", function (e) { onState(e && e.payload); }));
-      S.unlisten.push(await window.__TAURI__.event.listen("hydra://progress", function (e) { onProgress(e && e.payload); }));
+      S.unlisten.push(await window.__TAURI__.event.listen("hydra://state", function (e) {
+        onState(e && e.payload);
+      }));
+      S.unlisten.push(await window.__TAURI__.event.listen("hydra://progress", function (e) {
+        onProgress(e && e.payload);
+      }));
       window.addEventListener("beforeunload", function () {
-        S.unlisten.forEach(function (off) { try { off(); } catch (e) { /* page is going away */ } });
+        S.unlisten.forEach(function (off) { try { off(); } catch (err) { /* going away */ } });
         S.unlisten = [];
       });
       backend = true;
-    } catch (err) { /* no event channel: nothing can drive the transfer states */ }
+    } catch (err) { /* no event channel */ }
 
     try {
       var s = await invoke("get_settings", {});
@@ -845,8 +1121,13 @@
     } catch (err) { /* defaults stand */ }
 
     renderStepper();
+    rebuildList();
+    setView("compose", false);
     els.probeBtn.disabled = true;
-    setState("idle");
+    // The compose flow starts at the field the user must fill.
+    if (!document.body.dataset.view || document.body.dataset.view === "compose") {
+      els.urlInput.focus();
+    }
 
     if (backend) {
       els.engineBadge.hidden = false;
