@@ -934,9 +934,17 @@ async fn save_meta_offline(
         // then read the counters - claims every byte written during the fsync's
         // own window, which a crash at that moment silently loses.
         let snapshot = meta_snapshot(&url, size, chunk_size, &workers);
-        // A failed fsync FAILS the save: the sidecar may not outrun the data.
-        if let Ok(f) = OpenOptions::new().write(true).open(&part_path) {
-            f.sync_data()?;
+        // A failed fsync FAILS the save: the sidecar may not outrun the data. A
+        // .part that cannot even be OPENED has to fail the same way - the previous
+        // `if let Ok(f) = ...` skipped the fsync silently and went on to write a
+        // claim that nothing had made durable, which is the very hole this ordering
+        // exists to close.
+        match OpenOptions::new().write(true).open(&part_path) {
+            Ok(f) => f.sync_data()?,
+            // The bytes are already gone: a cancel or a cleanup swept them while
+            // this save was queued. Nothing to make durable, so nothing to claim.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
         }
         // Re-check: the cancel can land while the fsync above is running, and a
         // rename after that point would resurrect the sidecar cancel promised to
@@ -1609,6 +1617,40 @@ mod tests {
             !final_path.exists(),
             "cancel must not leave a finished file"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn save_meta_never_claims_bytes_it_cannot_fsync() {
+        let dir = temp_dir("save-meta-durability");
+        let part = dir.join("file.bin.part");
+        let meta_p = dir.join("file.bin.hydra.json");
+        let workers = vec![worker(0, Some(10), 0, 4)];
+        let cancelling = Arc::new(AtomicBool::new(false));
+        let url = "https://origin.example/file.bin";
+
+        // No .part on disk: the claim cannot be backed by data, so nothing is
+        // written. (This used to skip the fsync silently and save anyway.)
+        save_meta_offline(&meta_p, &part, url, 10, 10, &workers, &cancelling)
+            .await
+            .expect("a vanished .part is not an error, just nothing to save");
+        assert!(
+            !meta_p.exists(),
+            "a save with no data behind it must not write a sidecar"
+        );
+
+        // With the bytes present, the same call writes exactly what the workers
+        // reported - the snapshot is taken from the counters, not invented.
+        fs::write(&part, b"0123456789").unwrap();
+        save_meta_offline(&meta_p, &part, url, 10, 10, &workers, &cancelling)
+            .await
+            .expect("a save over real bytes succeeds");
+        let loaded = meta::load(&meta_p).expect("the sidecar must load back");
+        assert_eq!(loaded.url, url);
+        let done: u64 = loaded.chunks.iter().map(|c| c.done).sum();
+        assert_eq!(done, 4, "the sidecar claims exactly the reported progress");
+        assert!(!meta::tmp_path(&meta_p).exists(), "no temp left behind");
+
         let _ = fs::remove_dir_all(&dir);
     }
 
