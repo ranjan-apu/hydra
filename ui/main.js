@@ -92,7 +92,14 @@
     ariaPct: -1,
     stepperLocked: false,
     note: "",
-    liveConns: 0
+    liveConns: 0,
+    /// Generation counter for probe results: a late reply for an abandoned URL
+    /// must never be applied (it would show one file and download another).
+    probeSeq: 0,
+    /// Ids of runs that are already over. Their late events are ignored, so a
+    /// cancelled download cannot flip the next screen to paused/done.
+    deadIds: Object.create(null),
+    unlisten: []
   };
 
   var STATUS = {
@@ -319,6 +326,7 @@
   }
 
   async function doProbe(url) {
+    var seq = ++S.probeSeq;
     S.starting = false;
     S.dlId = null;
     clearUrlError();
@@ -326,6 +334,8 @@
     els.urlMsgText.textContent = "Checking the origin\u2026";
     try {
       var info = await invoke("probe_url", { url: url });
+      // The field may have been edited (or cleared) while this was in flight.
+      if (seq !== S.probeSeq || els.urlInput.value.trim() !== url) return;
       if (!info || typeof info !== "object") throw new Error("empty probe response");
       S.probe = info;
       S.metaSeq++;
@@ -334,6 +344,7 @@
       setState("ready");
       if (S.settings.destDir) metaCheck();
     } catch (err) {
+      if (seq !== S.probeSeq) return;
       S.probe = null;
       els.urlMsgText.textContent = "";
       setState("idle");
@@ -425,6 +436,7 @@
     els.transferError.hidden = true;
     els.transferErrorMsg.textContent = "";
     els.donePath.textContent = "";
+    els.donePath.classList.remove("is-error");
     els.connGrid.textContent = "";
     els.connGrid.removeAttribute("data-count");
     S.cells = [];
@@ -453,7 +465,11 @@
     clearUrlError();
     try {
       var res = await invoke("start_download", args);
-      if (S.starting && res && res.id) S.dlId = res.id;
+      // A terminal event may have already settled this run while the ack was in
+      // flight; resurrecting it as "downloading" would strand a dead transfer.
+      if (!S.starting) return;
+      S.starting = false;
+      if (res && res.id) S.dlId = res.id;
       setState("downloading");
     } catch (err) {
       S.starting = false;
@@ -475,10 +491,14 @@
 
   function onState(p) {
     if (!p) return;
-    if (S.starting && p.state === "downloading") {
+    // Late events from a run that is already over are noise (#13).
+    if (p.id != null && S.deadIds[p.id]) return;
+    if (S.starting && p.state === "downloading" && S.dlId == null) {
       S.dlId = p.id;
       S.starting = false;
     }
+    // Any terminal state ends the start handshake, whatever the ack says.
+    if (p.state === "done" || p.state === "error") S.starting = false;
     if (p.id != null && S.dlId != null && p.id !== S.dlId) return;
 
     switch (p.state) {
@@ -486,7 +506,7 @@
         clearUrlError();
         ensureTitle();
         setState("downloading");
-        if (p.note) showNote(p.note);
+        showNote(p.note || "");
         if (S.lastProgress) applyProgress(S.lastProgress);
         break;
       case "paused":
@@ -496,6 +516,7 @@
         break;
       case "done":
         ensureTitle();
+        showNote("");
         if (S.lastProgress) {
           try { applyProgress(S.lastProgress); } catch (e) { /* the panel below is the truth */ }
         }
@@ -513,6 +534,7 @@
         setState("done");
         break;
       case "error":
+        showNote("");
         showTransferError(p.message || "download failed");
         break;
     }
@@ -662,6 +684,7 @@
     if (e.key === "Enter") { e.preventDefault(); maybeProbe(); }
   });
   els.urlInput.addEventListener("input", function () {
+    S.probeSeq++; // invalidate any probe already in flight
     clearUrlError();
     if (S.probe) {
       S.probe = null;
@@ -711,6 +734,7 @@
   els.primaryBtn.addEventListener("click", function () {
     if (S.state === "done") {
       S.probe = null;
+      if (S.dlId != null) S.deadIds[S.dlId] = 1;
       S.dlId = null;
       S.lastProgress = null;
       S.finalPath = null;
@@ -722,6 +746,7 @@
       return;
     }
     if (S.state === "error") {
+      if (S.dlId != null) S.deadIds[S.dlId] = 1;
       S.dlId = null;
       S.starting = false;
       S.lastProgress = null;
@@ -773,7 +798,9 @@
       return;
     }
     els.cancelBtn.disabled = false;
-    // cancel leaves the probe valid, so return straight to ready
+    // cancel leaves the probe valid, so return straight to ready. The bridge
+    // only replied after the files were deleted, so a resume check here is honest.
+    if (S.dlId != null) S.deadIds[S.dlId] = 1;
     S.dlId = null;
     S.starting = false;
     S.lastProgress = null;
@@ -797,8 +824,14 @@
   async function init() {
     var backend = false;
     try {
-      await window.__TAURI__.event.listen("hydra://state", function (e) { onState(e && e.payload); });
-      await window.__TAURI__.event.listen("hydra://progress", function (e) { onProgress(e && e.payload); });
+      // Keep the unlisten handles: dropping them leaks a webview listener per
+      // init, which only matters if init is ever re-run without a reload.
+      S.unlisten.push(await window.__TAURI__.event.listen("hydra://state", function (e) { onState(e && e.payload); }));
+      S.unlisten.push(await window.__TAURI__.event.listen("hydra://progress", function (e) { onProgress(e && e.payload); }));
+      window.addEventListener("beforeunload", function () {
+        S.unlisten.forEach(function (off) { try { off(); } catch (e) { /* page is going away */ } });
+        S.unlisten = [];
+      });
       backend = true;
     } catch (err) { /* no event channel: nothing can drive the transfer states */ }
 
