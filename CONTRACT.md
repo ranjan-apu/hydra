@@ -35,16 +35,28 @@ Returns ProbeInfo:
 
     { "url": "https://final-after-redirects", "size": 7772412965, "acceptsRanges": true,
       "filename": "resolved-name.ext", "contentType": "application/octet-stream",
-      "probeMethod": "head" }
+      "probeMethod": "head", "server": "nginx/1.25.3" }
 
 size is null when unknown. Err(string) on failure: "could not connect to host", "HTTP 403", ...
+server is the raw `Server` response header of the response that decided the result; the key is
+omitted entirely when the origin sent none (it is the only additive field in this payload).
+
 Behavior: HEAD first; on 403/405/501 fall back to a ranged GET with header "Range: bytes=0-0".
 - Ranged GET -> 206 + Content-Range "bytes 0-0/TOTAL": acceptsRanges=true, size=TOTAL,
   probeMethod="range".
-- HEAD 200: size=Content-Length (null if absent); acceptsRanges = Accept-Ranges contains
-  "bytes"; probeMethod="head".
+- HEAD 200 WITH Accept-Ranges containing "bytes": acceptsRanges=true,
+  size=Content-Length (null if absent), probeMethod="head".
+- HEAD 200 WITHOUT Accept-Ranges: the header is advisory and many origins omit it while
+  honouring Range. One verification GET ("Range: bytes=0-0") decides: a 206 means
+  acceptsRanges=true (total from Content-Range when HEAD gave no length), a 200 means
+  acceptsRanges=false. probeMethod="range" when that GET decided. If the verification GET
+  itself fails, the HEAD conclusion stands - verification is an optimisation, never a
+  precondition.
 - Ranged GET -> 200 (Range ignored): acceptsRanges=false, size=Content-Length (null if absent),
   probeMethod="range".
+
+Only headers are read for any range verification: the body is dropped unread, so validating
+range support never pulls the file.
 
 ### start_download - args { url, destDir, filename, connections, size, acceptsRanges }
 url is the FINAL resolved URL from probe (workers should not re-follow redirects).
@@ -131,6 +143,8 @@ k=2,3,...) -> delete meta -> emit state "done" with path + size.
 "connection lost mid-download (after 5 retries)"
 "disk full"
 "destination is not writable: <path>"
+"the destination folder disappeared"
+"could not write to disk"
 "server returned an unexpected Content-Range"
 "downloaded size mismatch: expected <n>, got <m>"
 "empty response from server"
@@ -144,13 +158,17 @@ ETA "4m 12s" / "1h 03m".
 
 ## Headless speedtest harness (engine implements; testlab scripts consume)
 
-    src-tauri/target/release/examples/speedtest <url> [conns=4] [max_bytes=1073741824] [out=/tmp/hydra-speed.part] [run_seconds=0]
+    src-tauri/target/release/examples/speedtest <url> [conns=4] [max_bytes=1073741824] [out=/tmp/hydra-speed.part] [run_seconds=0] [cancel_after_secs=0]
 
 - Probes, then downloads the FIRST max_bytes bytes of <url> using the same engine core as the
   app, with conns static chunks over [0, max_bytes).
 - run_seconds > 0: after that many seconds of ACTIVE downloading, pause exactly like the app
   (flush sidecar at <out minus .part>.hydra.json, keep .part), print "PAUSED bytes=<n>", exit 0.
   A later run with the same url/out resumes from the meta (prints "RESUMED bytes=<n>").
+- cancel_after_secs > 0: after that many seconds of ACTIVE downloading, cancel exactly like the
+  app - stop the workers, then delete <out> and <out minus .part>.hydra.json (plus any
+  .hydra.json.tmp left by an in-flight save). Prints "CANCELLED bytes=<n>" and a SUMMARY with
+  cancelled=1, exit 0. Nothing may be left behind on disk.
 - Prints one "TICK t=<s> done=<bytes> speed_mibps=<x.x>" line per second.
 - Final machine-readable line: "SUMMARY ok=1 bytes=<n> elapsed_s=<x.x> avg_mibps=<y.y>
   resumed=<0|1> single=<0|1>" or "SUMMARY ok=0 error=<message>"; exit code 0 iff ok=1.
