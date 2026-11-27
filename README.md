@@ -37,7 +37,8 @@ Acceptance run (real CDN, reference file 7.77 GB, this checkout, scripts/accepta
    ranges but does not advertise them still gets the multi-connection speed.
 2. Before you commit, the probe reports size, range support, which method decided
    it (HEAD / Range GET), the answering server, and whether a resumable partial
-   already exists on disk
+   already exists on disk. The answering server stays on the transfer view while
+   that run is selected.
 3. Filename from Content-Disposition (filename* and filename=), else URL path
    basename - editable before start
 4. Native folder picker, remembered between launches

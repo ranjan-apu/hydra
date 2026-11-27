@@ -161,9 +161,15 @@
           <div class="stat"><span class="stat-key">Downloaded</span><span class="stat-value num" id="stat-bytes"></span></div>
           <div class="stat"><span class="stat-key">ETA</span><span class="stat-value num" id="stat-eta"></span></div>
         </div>
-        <div class="conn-summary" id="conn-summary-row">
-          <span class="conn-summary-key">Connections</span>
-          <span class="conn-summary-value num" id="conn-summary"></span>
+        <div class="detail-facts">
+          <div class="detail-fact">
+            <span class="detail-fact-key">Server</span>
+            <span class="detail-fact-value mono" id="dl-server"></span>
+          </div>
+          <div class="detail-fact" id="conn-summary-row">
+            <span class="detail-fact-key">Connections</span>
+            <span class="detail-fact-value num" id="conn-summary"></span>
+          </div>
         </div>
         <div class="conn-grid" id="conn-grid" aria-hidden="true"></div>
         <p class="state-note" id="state-note" hidden></p>

@@ -179,8 +179,11 @@ transfer view.
 The UI keeps a session-only list of runs (no persistence: a restart starts with an empty list,
 because the engine owns on-disk state, not the UI). Events are matched by id; an event for an id
 the list does not know is ignored, and an event for an id the user has retired (cancelled) is
-dropped. The UI never computes speed or ETA (backend supplies both); it formats: IEC bytes
-(GiB/MiB), speed MiB/s with 1 decimal, ETA "4m 12s" / "1h 03m".
+dropped. The probe's `server` is kept as per-run UI metadata - it is neither a
+`start_download` argument nor an engine event field - so the detail view can keep showing which
+origin answered, including after the run settles. The UI never computes speed or ETA (backend
+supplies both); it formats: IEC bytes (GiB/MiB), speed MiB/s with 1 decimal, ETA "4m 12s" /
+"1h 03m".
 
 Concurrency cap: MAX_CONCURRENT_DOWNLOADS (8) is enforced by the bridge; the UI mirrors it so
 "New download" reports the limit instead of letting a start fail, but the bridge is authoritative.

@@ -711,23 +711,39 @@ input[type="range"]:disabled::-webkit-slider-thumb { cursor: default; background
 }
 body[data-state="paused"] .stat-value { color: var(--muted); }
 
-.conn-summary {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--gap-3);
+/* One hairline-separated fact table: the origin that answered and the
+   connections doing the work. The server survives completion; connections
+   retire with the live run. */
+.detail > .detail-facts {
   margin-top: 15px;
   padding-top: 12px;
   border-top: 1px solid var(--hairline);
 }
-.conn-summary-key {
+.detail-fact {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--gap-3);
+  min-width: 0;
+}
+.detail-fact + .detail-fact { margin-top: 8px; }
+.detail-fact-key {
+  flex: none;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.055em;
   text-transform: uppercase;
   color: var(--faint);
 }
-.conn-summary-value { font-size: 11px; color: var(--muted); }
+.detail-fact-value {
+  min-width: 0;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.detail-fact-value.is-empty { color: var(--faint); }
 
 body[data-state="done"] .stats { display: none; }
 /* The card hugs its content; the pane's spare space stays background. A stage

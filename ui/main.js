@@ -60,6 +60,7 @@
     detailView: $("detail-view"),
     dlName: $("dl-name"),
     dlSub: $("dl-sub"),
+    dlServer: $("dl-server"),
     progressPct: $("progress-pct"),
     barTrack: $("bar-track"),
     barFill: $("bar-fill"),
@@ -206,6 +207,7 @@
       connections: args.connections,
       size: args.size,
       acceptsRanges: args.acceptsRanges,
+      server: args.server || null,
       state: "downloading",
       bytesDone: 0,
       total: args.size,
@@ -234,6 +236,7 @@
         if (existing.total == null) existing.total = item.size;
       }
       if (item.acceptsRanges != null) existing.acceptsRanges = item.acceptsRanges;
+      if (item.server) existing.server = item.server;
       updateRow(item.id);
       return existing;
     }
@@ -589,8 +592,12 @@
       size: S.probe.size,
       acceptsRanges: S.probe.acceptsRanges
     };
+    // The Server header is UI metadata, not part of the start_download wire
+    // contract. Capture it with the request so an event that beats the ack, or
+    // a later retry, still knows which origin answered.
+    var pending = Object.assign({}, args, { server: S.probe.server || null });
     S.starting = true;
-    S.pending = args;
+    S.pending = pending;
     S.adoptedId = null;
     S.composeError = "";
     renderCompose();
@@ -605,7 +612,7 @@
       // An event may have created the row already; keep the id the engine
       // actually returned and drop an adopted row that disagrees with it.
       if (adopted && adopted !== res.id) dropItem(adopted);
-      var item = addItem(makeItem(res.id, args));
+      var item = addItem(makeItem(res.id, pending));
       setView(item.id);
       resetCompose();
     } catch (err) {
@@ -652,6 +659,9 @@
       (item.state === "done" ? formatBytes(item.doneSize || item.total) + " \u00b7 " : "") +
       item.destDir;
     els.dlSub.title = item.destDir;
+    els.dlServer.textContent = item.server || "Not advertised";
+    els.dlServer.title = item.server || "";
+    els.dlServer.classList.toggle("is-empty", !item.server);
 
     var live = item.state === "downloading" || item.state === "paused" || item.state === "error";
     var finished = item.state === "done";
@@ -1025,8 +1035,9 @@
       // refused would put a retry into a mode that origin cannot serve.
       acceptsRanges: item.acceptsRanges !== false
     };
+    var pending = Object.assign({}, args, { server: item.server || null });
     S.starting = true;
-    S.pending = args;
+    S.pending = pending;
     S.adoptedId = null;
     try {
       var res = await invoke("start_download", args);
@@ -1037,7 +1048,7 @@
       S.adoptedId = null;
       if (adopted && adopted !== res.id) dropItem(adopted);
       if (S.items[item.id]) dropItem(item.id);
-      var fresh = addItem(makeItem(res.id, args));
+      var fresh = addItem(makeItem(res.id, pending));
       setView(fresh.id);
     } catch (err) {
       var adoptedOnError = S.adoptedId;
