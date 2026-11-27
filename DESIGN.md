@@ -84,6 +84,10 @@ moment - the three-stream mark breathes only while bytes are moving.
   3px soft ring, never a bare outline.
 - **Meta grid** - four labelled cells: Size, Ranges (pill: Supported / Not supported), Probe
   (HEAD / Range GET), Server. Uppercase micro keys, mono values.
+- **Detail facts** - a hairline-separated key/value table under the transfer stats: Server (the
+  probe's answering header, or "Not advertised", truncated with the full value in `title`) and
+  Connections (live completion count). Server survives done and error; Connections retires with
+  the live run.
 - **Resume note** - the only `--info` blue in the app: "Partial file found - 8.09 GiB of
   32.16 GiB done."
 - **Rail** - "New download" plate, a count of active runs, the list, and a teaching empty

@@ -24,7 +24,8 @@
   Reveal in Finder.
 - **What the probe surfaces** (this is product value, not chrome): size, whether ranges are
   supported, which method decided it (HEAD / Range GET), the answering server, and whether a
-  resumable partial already exists - all before the user commits to a download.
+  resumable partial already exists - all before the user commits to a download. The answering
+  server stays visible on the transfer view while that run is selected.
 - **Brand commitments**: "Hydra" wordmark over a three-stream brand mark that answers live
   transfer; a single spring-mint accent (#4fe0b0) on night-blue graphite; monospace for all
   data (URLs, names, paths, byte counts); English copy; no emoji - hand-drawn inline SVGs only.
